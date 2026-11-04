@@ -1,0 +1,29 @@
+{
+  "name": "@hydroid/arb",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node --no-opt --env-file-if-exists=.env --env-file-if-exists=../.env --import tsx src/main.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@galacticcouncil/descriptors": "2.8.0",
+    "@galacticcouncil/sdk-next": "2.0.0",
+    "@polkadot-labs/hdkd": "^0.0.32",
+    "@polkadot-labs/hdkd-helpers": "^0.0.13",
+    "polkadot-api": "^2.1.7",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
