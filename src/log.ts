@@ -8,6 +8,24 @@
  */
 const out = process.stdout;
 const useColor = out.isTTY && !process.env.NO_COLOR;
+
+/**
+ * ARB_ASCII=1: print only ASCII. For terminals whose font lacks symbols and
+ * block characters (they show as empty boxes), e.g. PuTTY or mRemoteNG with
+ * the default font.
+ */
+export const ascii = process.env.ARB_ASCII === '1';
+
+const TO_ASCII: Record<string, string> = {
+  '·': '|', '→': '->', '⇄': '<->', '…': '...', '—': '-', '–': '-', '−': '-', '─': '-', '┄': '-', '│': '|',
+  '┤': '|', '└': '+', '✓': '+', '✗': 'x', '●': '*', '◆': '@', '▸': '>', '≥': '>=', '≤': '<=', '×': 'x',
+};
+
+/** Replace the symbols the bot prints with ASCII look-alikes; anything else non-ASCII becomes '?'. */
+export function toAscii(s: string): string {
+  return s.replace(/[^\x00-\x7f]/gu, (ch) => TO_ASCII[ch] ?? '?');
+}
+const plain = (s: string) => (ascii ? toAscii(s) : s);
 const paint = (code: number) => (s: string) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
 
 export const c = {
@@ -49,7 +67,7 @@ export function fit(s: string, width: number): string {
       if (left === 0) break;
     }
   }
-  return `${res}…${useColor ? '\x1b[0m' : ''}`;
+  return `${res}${ascii ? '>' : '…'}${useColor ? '\x1b[0m' : ''}`;
 }
 
 let render: (() => string[]) | null = null;
@@ -66,7 +84,11 @@ function clearLive(): void {
 function drawLive(): void {
   if (!render) return;
   const width = Math.max(20, (out.columns || 80) - 1);
-  const lines = render().map((l) => fit(l, width));
+  // The region is cleared by moving the cursor up; it must never be taller than the screen.
+  const maxRows = Math.max(1, (out.rows || 24) - 1);
+  const lines = render()
+    .slice(0, maxRows)
+    .map((l) => fit(plain(l), width));
   out.write(lines.join('\n'));
   drawn = lines.length;
 }
@@ -116,7 +138,7 @@ export function stopLive(): void {
 
 /* --------------------------------------------------------------- logging */
 
-const print = (msg: string) => console.log(msg);
+const print = (msg: string) => console.log(plain(msg));
 
 export const log = {
   info: (msg: string) => print(`${ts()} ${msg}`),

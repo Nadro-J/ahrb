@@ -27,7 +27,7 @@ Every 12 s tick in `main.ts`: read balances (`Book`) and USD prices on both chai
 - `executor.ts` adds the real network fees (`getEstimatedFees` on the actual txs), applies the profit floor, sets slippage limits, dry-runs, and sends. Every action runs inside `measured()`, which reads both chains' balances before and after and writes the delta, valued at the pre-action prices, to the ledger. Realized P&L is always measured, never taken from quotes. Errors whose message starts with `HALT:` inside `measured()` are turned into a `Halt`.
 - `venues.ts`: Asset Hub `AssetConversion` (every pool pairs with DOT, so `ahPath` routes non-DOT pairs through DOT), the Asset Hub PSM (USDT ⇄ dotUSD), the Hydration router via `@galacticcouncil/sdk-next`, and the XCM builders (`transfer_assets_using_type_and_then`: LocalReserve AH→HY, DestinationReserve HY→AH, at most 2 assets per message, DOT first).
 - `chains.ts`: connections, sr25519 key derivation, balances, prices, and `send` (always dry-run first, then sign).
-- `log.ts`: all output. On a TTY, `main.ts` registers `renderLive()` as a live region that redraws in place every second at the bottom of the screen. The bot runs on a Raspberry Pi and is watched over SSH. Normal log lines print above the region; while it is active, `console.log/error/warn` are wrapped so stray SDK output can't tear it. Off a TTY, or with `ARB_PLAIN=1`, every tick prints a plain line. Print through `log.*`, never with raw `process.stdout.write`. The sparklines in the region come from `chart.ts` (pure, with specs), fed one sample per tick by `recordSample()` in `main.ts`.
+- `log.ts`: all output. On a TTY, `main.ts` registers `renderLive()` as a live region that redraws in place every second at the bottom of the screen. The bot runs on a Raspberry Pi and is watched over SSH. Normal log lines print above the region; while it is active, `console.log/error/warn` are wrapped so stray SDK output can't tear it. Off a TTY, or with `ARB_PLAIN=1`, every tick prints a plain line. Print through `log.*`, never with raw `process.stdout.write`. The charts in the region (`linePlot`, `barPlot`, sparklines) come from `chart.ts`, which is pure and has specs. `recordSample()` in `main.ts` feeds them one sample per tick. Every printed line passes through `toAscii()` when `ARB_ASCII=1`, so a new symbol needs an entry in `TO_ASCII` in `log.ts`, or it prints as `?`.
 - `pnl.ts`: `data/state.json` (running totals, baseline, `bootstrapped` flag) and `data/ledger.jsonl` (one line per action). Total P&L = arb + setup + rebalance + market. Delete both files to reset the baseline.
 - `assets.ts`: asset IDs, locations and decimals (DOT 10, USDT/USDC/dotUSD 6, HDX 12). Amounts are `bigint` native units everywhere; convert with `native()` / `human()`.
 
@@ -67,7 +67,9 @@ PSM is only one of the strategies, and on Asset Hub only (dotUSD is not register
 | `ARB_DATA_DIR` | `./data` | Ledger, state and the `STOP` file |
 | `ARB_KILL` | — | `1` = refuse to run |
 | `ARB_PLAIN` | — | `1` = no live status region (plain line per tick) |
-| `ARB_CHART_MINUTES` | `5` | History window of the live sparklines (`chart.ts`); `0` hides them |
+| `ARB_CHART_MINUTES` | `5` | History window of the live charts (`chart.ts`); `0` hides them |
+| `ARB_CHART_HEIGHT` | `8` | Rows for the price plot; shrinks to fit the terminal, `1` = one-line sparklines |
+| `ARB_ASCII` | — | `1` = ASCII only (fonts in PuTTY/mRemoteNG show boxes for block/box/braille glyphs) |
 
 Hard-coded values that may also need tuning: `MAX_FAILED_IN_A_ROW = 3` (`main.ts`), `RESERVE` and the ladder steps (`strategy.ts`), the 40/40/20 and 50/50 slippage splits and the 10-minute XCM arrival timeout (`executor.ts`).
 

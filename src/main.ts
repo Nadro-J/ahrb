@@ -19,8 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { CHAIN_NAME, human, SYMS, type Chain } from './assets.js';
 import { connect, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
 import { bootstrap, dotPrices, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
-import { extent, sparkline } from './chart.js';
-import { c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
+import { barPlot, extent, linePlot, sparklineIn } from './chart.js';
+import { ascii, c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
 import { Ledger } from './pnl.js';
 import { describe, findOpportunities, label, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
 import { ahQuoteIn, ahQuoteOut, hyBuy, hySell, psmState } from './venues.js';
@@ -47,6 +47,7 @@ const config = {
   pollSeconds: num('ARB_POLL_SECONDS', 12),
   summaryEvery: num('ARB_SUMMARY_EVERY', 25),
   chartMinutes: num('ARB_CHART_MINUTES', 5),
+  chartHeight: num('ARB_CHART_HEIGHT', 8),
 };
 
 const MAX_FAILED_IN_A_ROW = 3;
@@ -89,33 +90,79 @@ function recordSample(ah: number, hy: number | null, near: number | null): void 
   while (history.length && history[0]!.t < now - config.chartMinutes * 60_000) history.shift();
 }
 
-/** Sparklines of the last few minutes: DOT on both chains (shared scale), the spread, and the nearest trade vs zero. */
-function renderCharts(): string[] {
+const charset = ascii ? 'ascii' : 'unicode';
+
+/** How far back the history goes, as an axis label: "-45s", "-5m". */
+function span(): string {
+  const secs = Math.round((history.at(-1)!.t - history[0]!.t) / 1000);
+  return secs < 90 ? `-${secs}s` : `-${Math.round(secs / 60)}m`;
+}
+
+/**
+ * Charts of the last few minutes, sized to the terminal:
+ *  - big (ARB_CHART_HEIGHT ≥ 3 and room on screen): DOT price on both chains
+ *    as a line plot, and the nearest trade as bars around $0;
+ *  - compact: one-line sparklines for price, spread and nearest trade;
+ *  - none, when even that doesn't fit.
+ * `statusRows` is what the status lines above already use; a few rows are left
+ * free so the latest log lines stay visible.
+ */
+function renderCharts(statusRows: number): string[] {
   if (!config.chartMinutes || history.length < 2) return [];
-  const width = Math.max(10, Math.min(120, (process.stdout.columns || 80) - 1 - 11 - 26));
+  const cols = (process.stdout.columns || 80) - 1;
+  const free = (process.stdout.rows || 24) - 1 - statusRows - 6;
   const ah = history.map((h) => h.ah);
   const hy = history.map((h) => h.hy);
-  const spread = history.map((h) => (h.hy ? ((h.hy - h.ah) / h.ah) * 100 : null));
   const near = history.map((h) => h.near);
+  const nearPaint = (bar: string, v: number) => (v > 0 ? c.green(bar) : c.dim(bar));
+
+  // Big: title + plot + 2 axis rows, twice.
+  const labelWidth = 10;
+  const width = Math.max(10, Math.min(history.length, cols - labelWidth - 2));
+  // Shrink the plots until both fit: each has a title row, its own rows and two axis rows.
+  const nearRows = (h: number) => Math.max(3, Math.round(h * 0.6));
+  let priceH = Math.floor(config.chartHeight);
+  while (priceH >= 3 && 3 + priceH + 3 + nearRows(priceH) > free) priceH -= 1;
+  const nearH = nearRows(priceH);
+  if (priceH >= 3) {
+    const opts = { charset, labelWidth, leftLabel: span() } as const;
+    const ahMark = c.cyan(ascii ? 'o' : '●');
+    const hyMark = c.magenta(ascii ? 'x' : '●');
+    return [
+      `  ${c.bold('DOT price')}   ${ahMark} Asset Hub   ${hyMark} Hydration   ${c.dim(`${ascii ? '@' : '◆'} both`)}`,
+      ...linePlot(
+        [
+          { values: ah, mark: ascii ? 'o' : '●', paint: c.cyan },
+          { values: hy, mark: ascii ? 'x' : '●', paint: c.magenta },
+        ],
+        width,
+        priceH,
+        (v) => `$${v.toFixed(4)}`,
+        opts
+      ).map((r, i, all) => (i >= all.length - 2 ? c.dim(r) : r)),
+      `  ${c.bold('nearest trade')} ${c.dim('gross, before network fees · trades only above $0 + fees')}`,
+      ...barPlot(near, width, nearH, (v) => usd(v, 3), { ...opts, paint: nearPaint }).map((r, i, all) =>
+        i >= all.length - 2 ? c.dim(r) : r
+      ),
+    ];
+  }
+
+  // Compact: a heading and three sparklines.
+  if (free < 4) return [];
+  const sw = Math.max(10, Math.min(120, cols - 11 - 26));
+  const spread = history.map((h) => (h.hy ? ((h.hy - h.ah) / h.ah) * 100 : null));
   const px = extent([...ah, ...hy]);
   const sp = extent(spread, 0);
   const nr = extent(near, 0);
   const row = (name: string, chart: string, legend: string) => `  ${c.dim(name.padEnd(9))}${chart}  ${c.dim(legend)}`;
-  const mins = Math.round((history.at(-1)!.t - history[0]!.t) / 60_000);
-  const lines = [c.dim(`  ── last ${mins < 1 ? '<1' : mins} min ${'─'.repeat(Math.max(0, width - 8))}`)];
-  if (px) {
-    lines.push(row('DOT AH', c.cyan(sparkline(ah, width, px)), `$${px[0].toFixed(4)}–$${px[1].toFixed(4)}`));
-    lines.push(row('DOT HY', c.magenta(sparkline(hy, width, px)), 'same scale'));
-  }
-  if (sp) lines.push(row('spread', sparkline(spread, width, sp), `${sp[0].toFixed(2)}% … ${sp[1] >= 0 ? '+' : ''}${sp[1].toFixed(2)}%`));
-  if (nr) {
-    const bars = sparkline(near, width, nr, (bar, v) => (v > 0 ? c.green(bar) : c.dim(bar)));
-    lines.push(row('nearest', bars, `${usd(nr[0], 3)} … ${usd(nr[1], 3)} (green > 0)`));
-  }
+  const lines = [c.dim(`  ── last ${span().slice(1)} ${'─'.repeat(Math.max(0, sw - 8))}`)];
+  if (px) lines.push(row('DOT AH/HY', c.cyan(sparklineIn(charset, ah, sw, px)), `$${px[0].toFixed(4)}–$${px[1].toFixed(4)}`));
+  if (sp) lines.push(row('spread', sparklineIn(charset, spread, sw, sp), `${sp[0].toFixed(2)}% … ${sp[1] >= 0 ? '+' : ''}${sp[1].toFixed(2)}%`));
+  if (nr) lines.push(row('nearest', sparklineIn(charset, near, sw, nr, nearPaint), `${usd(nr[0], 3)} … ${usd(nr[1], 3)} (green > 0)`));
   return lines;
 }
 
-const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+const SPIN = ascii ? '|/-\\' : '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 const hhmm = () => new Date().toISOString().slice(11, 16);
 
 function ago(ms: number): string {
@@ -150,7 +197,7 @@ function renderLive(): string[] {
 
   const lines = [line1, line2, line3];
   if (ui.skip) lines.push(c.dim(`  skipping: ${ui.skip}`));
-  return [...lines, ...renderCharts()];
+  return [...lines, ...renderCharts(lines.length)];
 }
 
 function printBook(book: Book, p: Prices, ledger: Ledger): void {

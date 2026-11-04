@@ -164,6 +164,8 @@ All settings come from the environment (or `.env`):
 | `ARB_KILL` | none | `1` refuses to run |
 | `ARB_PLAIN` | none | `1` turns off the live status lines |
 | `ARB_CHART_MINUTES` | `5` | how much history the live charts show; `0` hides them |
+| `ARB_CHART_HEIGHT` | `8` | rows for the price chart (the trade chart gets ~60 %); `1` = one-line sparklines |
+| `ARB_ASCII` | none | `1` prints plain ASCII only, for fonts that show boxes |
 
 ## Screen output
 
@@ -174,28 +176,56 @@ place every second instead of printing a line every tick:
 ● LIVE #482 up 1h36m · DOT $0.9526 AH / $0.9519 HY (-0.07%) · next check 4s
   nearest trade -$0.0123 DOT/USDT sell AH→buy HY · best since start -$0.0040 at 14:02
   equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$0.5) · arbs 0 · last trade none yet
-  ── last 5 min ───────────────────────────────────
-  DOT AH   ▅▆▆▆▇▇▇███████▇▇▇▆▆▅▅▄▄▄▃▃▃▃▃▂▃▃▃▃▃▄▄▅▅▆▆▆▇  $0.9501–$0.9532
-  DOT HY   ▄▅▅▆▇▇████▇▇▆▅▄▄▃▃▂▂▂▂▂▃▃▃▃▃▃▃▂▂▂▁▁▁▁▁▂▂▃▃▄  same scale
-  spread   ▅▅▆▇▇███▇▇▆▅▄▃▂▁▁▁▁▂▃▄▄▅▆▇████▇▆▅▄▃▃▂▁▁▁▁▂▃  -0.17% … +0.02%
-  nearest  ▄▄▅▅▅▆▆▆▆▆▆▅▅▄▃▃▂▂▁▁▁▁▁▁▂▂▃▃▄▄▅▆▆▆██▇▅▅▅▄▄▃  -$0.045 … +$0.010 (green > 0)
+  DOT price   ● Asset Hub   ● Hydration   ◆ both
+   $0.9532 ┤      ●◆◆◆◆●●●●●
+           ┤    ◆◆●    ●●   ●●●                             ●●
+           ┤ ●●◆         ●     ●●●                       ●●●
+   $0.9519 ┤●●●           ●●      ●●                   ●●    ●
+           ┤●               ●●      ●●●             ●●●     ●
+           ┤                  ●●      ●◆◆◆◆◆◆●◆●●●●●      ●●
+           ┤                    ●●●●●●       ● ●●●      ●●
+   $0.9501 ┤                                      ●●●●●●
+           └──────────────────────────────────────────────────
+            -5m                                            now
+  nearest trade gross, before network fees · trades only above $0 + fees
+   +$0.010 ┤                                       ███
+    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄███┄┄┄┄┄┄┄┄
+           ┤█████       ████████████████████████        ██████
+           ┤█               ████████████████               ███
+   -$0.045 ┤                    ████████
+           └──────────────────────────────────────────────────
+            -5m                                            now
 ```
 
-How to read the charts (one bar per tick, newest on the right):
+How to read the charts (newest on the right):
 
-- **DOT AH / DOT HY**: DOT's price on each chain, on one shared scale, so the
-  gap between the two lines is the arbitrage gap.
-- **spread**: Hydration's DOT price minus Asset Hub's, in %. The bot needs
-  roughly ±0.6–0.8 % before a cross-chain trade pays.
-- **nearest**: the best candidate's gross profit each tick. Its range always
-  includes $0, and bars above $0 are green. Green bars that don't lead to a
-  trade were eaten by network fees or the profit floor.
+- **DOT price**: DOT on Asset Hub and on Hydration on one shared scale. The
+  vertical distance between the two lines is the arbitrage gap. ◆ marks where
+  both prices are equal.
+- **nearest trade**: the best candidate's gross profit each tick, as bars
+  around the $0 line. Bars hang below $0 while nothing pays. Bars that rise
+  above it turn green but still need to clear network fees and
+  `ARB_MIN_PROFIT_USD` before a trade happens.
 
-*Nearest trade* is the best candidate this tick, before network fees. It has
-to go positive and then clear the fees plus `ARB_MIN_PROFIT_USD` before
-anything trades. Trades, rebalances, errors and the balance table scroll
-above the status, so the scrollback holds only what happened. The status is
-cut to the terminal width, which keeps it usable from a phone.
+The charts shrink to fit the window. With little room they turn into one-line
+sparklines, and if even that doesn't fit they are hidden. Set
+`ARB_CHART_HEIGHT=1` to always use sparklines, or a higher number for taller
+charts.
+
+### Boxes instead of symbols (PuTTY, mRemoteNG)
+
+If the charts show as empty squares, the terminal's font lacks those
+characters. Either:
+
+- **Fix the font** (recommended). In mRemoteNG: *Tools → Options → Advanced →
+  Launch PuTTY*, load the session that mRemoteNG uses (*Default Settings*
+  unless you set one), then set *Window → Appearance → Font* to **Consolas**
+  or **Cascadia Mono** and *Window → Translation → Remote character set* to
+  **UTF-8**. Click *Save*.
+- **Or use a better client**: Windows Terminal (built into Windows 11, and in
+  the Store for 10) renders everything out of the box: `ssh pi@raspberrypi.local`.
+- **Or set `ARB_ASCII=1`**, which draws everything with plain ASCII
+  (`o`/`x` points, `#` bars, `|` and `-` axes) and works in any font.
 
 When stdout is not a terminal (a log file, systemd/journald) or `ARB_PLAIN=1`,
 it prints one line per tick, as before.

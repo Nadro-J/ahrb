@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extent, resample, sparkline } from './chart.js';
+import { barPlot, extent, linePlot, resample, sparkline, sparklineIn } from './chart.js';
 
 describe('sparkline', () => {
   it('spans the lowest to the highest bar', () => {
@@ -23,5 +23,42 @@ describe('sparkline', () => {
   it('extent can force a value such as zero into the range', () => {
     expect(extent([-3, -1], 0)).toEqual([-3, 0]);
     expect(extent([null])).toBeNull();
+  });
+});
+
+const ascii = { charset: 'ascii' as const, labelWidth: 4, leftLabel: '-5m' };
+const strip = (rows: string[]) => rows.map((r) => r.trimEnd());
+
+describe('linePlot', () => {
+  it('draws each series on a shared scale, marking overlaps', () => {
+    const rows = linePlot(
+      [
+        { values: [1, 2, 3], mark: 'o' },
+        { values: [3, 2, 1], mark: 'x' },
+      ],
+      3,
+      3,
+      (v) => v.toFixed(0),
+      ascii
+    );
+    expect(strip(rows)).toEqual(['   3 |x o', '   2 | @', '   1 |o x', '     +---', '      -5m now']);
+  });
+});
+
+describe('barPlot', () => {
+  it('hangs negative bars below the zero line and stands positive ones on it', () => {
+    const rows = barPlot([-2, 0, 2], 3, 5, (v) => v.toFixed(0), ascii);
+    expect(strip(rows.slice(0, 5))).toEqual(['   2 |  #', '     |  #', '   0 |--#', '     |#', '  -2 |#']);
+  });
+
+  it('labels the zero line even when every value is negative', () => {
+    const rows = barPlot([-1, -3], 2, 4, (v) => v.toFixed(0), ascii);
+    expect(strip(rows.slice(0, 4))).toEqual(['   0 |--', '     |##', '     | #', '  -3 | #']);
+  });
+});
+
+describe('sparklineIn', () => {
+  it('maps the bars to ASCII', () => {
+    expect(sparklineIn('ascii', [1, 2, 3, 4, 5, 6, 7, 8], 8)).toBe('.:-=+*#@');
   });
 });
