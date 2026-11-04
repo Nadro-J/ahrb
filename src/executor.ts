@@ -201,21 +201,21 @@ export async function ensureHydrationFeeCurrency(ctx: Ctx): Promise<void> {
 
 /* ==================================================================== arbs */
 
+export type ArbOutcome = { outcome: 'ok' | 'failed' } | { outcome: 'skipped'; reason: string };
+
 /**
  * Execute an opportunity if it still clears every cost. 'skipped' means
- * nothing was sent (stale, or below the profit floor once fees are known).
+ * nothing was sent (stale, or below the profit floor once fees are known);
+ * the caller decides whether to print the reason.
  */
-export async function executeArb(ctx: Ctx, o: Opportunity, p: Prices, psm: PsmState | null): Promise<'skipped' | 'ok' | 'failed'> {
+export async function executeArb(ctx: Ctx, o: Opportunity, p: Prices, psm: PsmState | null): Promise<ArbOutcome> {
   const plan = o.kind === 'xchain' ? await planXchain(ctx, o, p) : await planPsm(ctx, o, p, psm);
-  if (typeof plan === 'string') {
-    log.info(color.dim(`  skip: ${plan}`));
-    return 'skipped';
-  }
+  if (typeof plan === 'string') return { outcome: 'skipped', reason: plan };
   const res = await measured(ctx, 'arb', describe(o, p), async (txs) => {
     await plan.run(txs);
     return { expectedUsd: plan.netUsd };
   });
-  return res.ok ? 'ok' : 'failed';
+  return { outcome: res.ok ? 'ok' : 'failed' };
 }
 
 interface Plan {

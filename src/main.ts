@@ -2,7 +2,7 @@
  * Asset Hub ⇄ Hydration arbitrage bot. Runs live with real funds — there is
  * no paper mode.
  *
- *   ARB_MNEMONIC="word1 … word12" npm start -w arb
+ *   ARB_MNEMONIC="word1 … word12" npm start
  *
  * Every tick: read balances and prices on both chains, quote every candidate
  * (cross-chain DOT/USDT/USDC spreads and the Asset Hub PSM peg), and execute
@@ -17,11 +17,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHAIN_NAME, human, SYMS, type Chain } from './assets.js';
-import { connect, readBook, readPrices, sleep, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
+import { connect, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
 import { bootstrap, dotPrices, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
-import { c, log, usd, usdColored } from './log.js';
+import { c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
 import { Ledger } from './pnl.js';
-import { describe, findOpportunities, planRebalance, type Limits, type Quoter } from './strategy.js';
+import { describe, findOpportunities, label, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
 import { ahQuoteIn, ahQuoteOut, hyBuy, hySell, psmState } from './venues.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -55,6 +55,67 @@ function killSwitch(): string | null {
   return null;
 }
 
+/* ---------------------------------------------------------- live status */
+
+type Phase = 'starting' | 'rebalancing' | 'quoting' | 'trading' | 'waiting' | 'stopping';
+
+/** What the live status region shows; updated by the loop, drawn every second by log.ts. */
+const ui = {
+  started: Date.now(),
+  tick: 0,
+  phase: 'starting' as Phase,
+  nextAt: 0,
+  dot: null as { ah: number; hy: number | null } | null,
+  /** The best candidate this tick, losing or not (gross, before tx fees). */
+  closest: null as { what: string; gross: number } | null,
+  /** The best candidate seen since start. */
+  record: null as { what: string; gross: number; at: string } | null,
+  skip: null as string | null,
+  equity: 0,
+  pnl: 0,
+  day: 0,
+  arbs: { done: 0, failed: 0 },
+  lastTrade: null as string | null,
+};
+
+const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+const hhmm = () => new Date().toISOString().slice(11, 16);
+
+function ago(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${Math.floor(h / 24)}d${h % 24}h`;
+}
+
+function renderLive(): string[] {
+  const busy = ui.phase !== 'waiting';
+  const pulse = busy ? c.cyan(SPIN[Math.floor(Date.now() / 250) % SPIN.length]!) : c.green('●');
+  const doing = busy ? c.cyan(ui.phase) : c.dim(`next check ${Math.max(0, Math.ceil((ui.nextAt - Date.now()) / 1000))}s`);
+  let dot = '';
+  if (ui.dot) {
+    const { ah, hy } = ui.dot;
+    const spread = hy ? ((hy - ah) / ah) * 100 : null;
+    dot = ` · DOT ${c.cyan('$' + ah.toFixed(4))} AH / ${c.cyan(hy ? '$' + hy.toFixed(4) : '?')} HY`;
+    if (spread !== null) dot += c.dim(` (${spread >= 0 ? '+' : ''}${spread.toFixed(2)}%)`);
+  }
+  const line1 = `${pulse} ${c.bold('LIVE')} #${ui.tick} ${c.dim('up ' + ago(Date.now() - ui.started))}${dot} · ${doing}`;
+
+  const near = ui.closest ? `${usdColored(ui.closest.gross)} ${c.dim(ui.closest.what)}` : c.dim('—');
+  const rec = ui.record ? ` · best since start ${usdColored(ui.record.gross)} ${c.dim('at ' + ui.record.at)}` : '';
+  const line2 = `  nearest trade ${near}${rec}`;
+
+  const line3 =
+    `  equity $${ui.equity.toFixed(2)} · P&L ${usdColored(ui.pnl, 2)} · today ${usdColored(ui.day, 2)}` +
+    c.dim(` (halt at −$${config.maxDailyLossUsd})`) +
+    ` · arbs ${ui.arbs.done}${ui.arbs.failed ? c.red(` (${ui.arbs.failed} failed)`) : ''}` +
+    c.dim(` · last trade ${ui.lastTrade ?? 'none yet'}`);
+
+  const lines = [line1, line2, line3];
+  if (ui.skip) lines.push(c.dim(`  skipping: ${ui.skip}`));
+  return lines;
+}
+
 function printBook(book: Book, p: Prices, ledger: Ledger): void {
   const cols = [...SYMS, 'dotUSD', 'HDX'] as const;
   const dec: Record<(typeof cols)[number], number> = { DOT: 10, USDT: 6, USDC: 6, dotUSD: 6, HDX: 12 };
@@ -67,6 +128,7 @@ function printBook(book: Book, p: Prices, ledger: Ledger): void {
   const equity = usdOf(book, p);
   const s = ledger.summary(equity);
   const a = ledger.state.arbs;
+  syncUi(book, p, ledger);
   log.raw(
     `  ${c.bold('Equity')} $${equity.toFixed(2)} ${c.dim(`(DOT $${p.DOT.toFixed(4)})`)}  ` +
       `${c.bold('P&L')} ${usdColored(s.total)} = arb ${usdColored(s.arb)} · setup ${usdColored(s.setup)} · rebalance ${usdColored(s.rebalance)} · market ${usdColored(s.market)}`
@@ -77,9 +139,16 @@ function printBook(book: Book, p: Prices, ledger: Ledger): void {
   );
 }
 
+function syncUi(book: Book, p: Prices, ledger: Ledger): void {
+  ui.equity = usdOf(book, p);
+  ui.pnl = ledger.summary(ui.equity).total;
+  ui.day = ledger.dayPnl();
+  ui.arbs = { done: ledger.state.arbs.done, failed: ledger.state.arbs.failed };
+}
+
 async function main(): Promise<void> {
   if (!config.mnemonic) {
-    log.error('set ARB_MNEMONIC to the account mnemonic (in the environment or in ../.env)');
+    log.error('set ARB_MNEMONIC to the account mnemonic (in the environment or in .env)');
     process.exit(1);
   }
   const w = walletFromMnemonic(config.mnemonic, config.derivation);
@@ -92,6 +161,10 @@ async function main(): Promise<void> {
     )
   );
 
+  if (process.env.SSH_CONNECTION && !process.env.TMUX && !process.env.STY) {
+    log.warn('running over SSH outside tmux/screen: closing the SSH session stops the bot. See README "Running on a server".');
+  }
+
   const stop = killSwitch();
   if (stop) {
     log.warn(`kill switch is on (${stop}) — not starting`);
@@ -103,11 +176,19 @@ async function main(): Promise<void> {
   log.ok('connected');
 
   let stopping = false;
-  process.on('SIGINT', () => {
-    if (stopping) process.exit(130);
+  let wake: (() => void) | null = null;
+  const requestStop = (signal: NodeJS.Signals) => {
+    if (stopping && signal === 'SIGINT') process.exit(130);
     stopping = true;
-    log.warn('stopping after the current step (Ctrl+C again to force)');
-  });
+    ui.phase = 'stopping';
+    log.warn(`${signal}: stopping after the current step${signal === 'SIGINT' ? ' (Ctrl+C again to force)' : ''}`);
+    wake?.();
+  };
+  process.on('SIGINT', requestStop);
+  process.on('SIGTERM', requestStop); // systemd stop
+  process.on('SIGHUP', requestStop); // terminal closed
+  // With the terminal gone, writes fail with EIO; finishing the current step matters more than the output.
+  process.stdout.on('error', () => {});
 
   try {
     let [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
@@ -132,8 +213,12 @@ async function main(): Promise<void> {
 
     let tick = 0;
     let failedInARow = 0;
+    let lastSkipped: string | null = null;
+    syncUi(book, p, ledger);
+    startLive(renderLive);
     while (!stopping) {
       tick += 1;
+      ui.tick = tick;
       const kill = killSwitch();
       if (kill) throw new Halt(`kill switch (${kill})`);
       if (ledger.dayPnl() <= -config.maxDailyLossUsd) throw new Halt(`daily loss limit hit (${usd(ledger.dayPnl())})`);
@@ -142,31 +227,61 @@ async function main(): Promise<void> {
         [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
         let acted = false;
 
+        syncUi(book, p, ledger);
         const moves = planRebalance(book, p, limits);
         if (moves.length) {
+          ui.phase = 'rebalancing';
           await rebalance(ctx, moves);
           acted = true;
           [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
         }
 
+        ui.phase = 'quoting';
+        let closest: Opportunity | null = null;
+        const observe = (o: Opportunity) => {
+          if (!closest || o.grossUsd > closest.grossUsd) closest = o;
+        };
         const psm = await psmState(chains).catch(() => null);
-        const [opps, dot] = await Promise.all([findOpportunities(quoter, book, p, limits, psm), dotPrices(ctx, p)]);
+        const [opps, dot] = await Promise.all([findOpportunities(quoter, book, p, limits, psm, observe), dotPrices(ctx, p)]);
+        ui.dot = dot;
+        const near = closest as Opportunity | null;
+        ui.closest = near ? { what: label(near), gross: near.grossUsd } : null;
+        if (near && (!ui.record || near.grossUsd > ui.record.gross)) ui.record = { what: label(near), gross: near.grossUsd, at: hhmm() };
+
         const spread = dot.hy ? ((dot.hy - dot.ah) / dot.ah) * 100 : null;
         const head =
           `#${tick} DOT ${c.cyan('$' + dot.ah.toFixed(4))} AH / ${c.cyan(dot.hy ? '$' + dot.hy.toFixed(4) : '?')} HY` +
           (spread !== null ? c.dim(` (${spread >= 0 ? '+' : ''}${spread.toFixed(2)}%)`) : '');
         const best = opps[0];
-        if (!best) log.info(`${head} · ${c.dim('no edge after pool fees')}`);
-        else {
-          log.info(`${head} · best: ${describe(best, p)} · gross ${usdColored(best.grossUsd)}`);
-          const outcome = await executeArb(ctx, best, p, psm);
-          if (outcome !== 'skipped') acted = true;
-          if (outcome === 'failed') failedInARow += 1;
-          if (outcome === 'ok') failedInARow = 0;
+        if (!best) {
+          ui.skip = null;
+          lastSkipped = null;
+          // On a terminal the live status shows this; a log file gets a line per tick.
+          if (!liveEnabled) log.info(`${head} · ${c.dim('no edge after pool fees')}`);
+        } else {
+          ui.phase = 'trading';
+          const res = await executeArb(ctx, best, p, psm);
+          if (res.outcome === 'skipped') {
+            // A spread that is too thin to trade can last for hours; print it once, keep it in the status.
+            const key = `${label(best)}|${res.reason.replace(/[-+$\d.]+/g, '')}`;
+            if (!liveEnabled || key !== lastSkipped) {
+              log.info(`${head} · best: ${describe(best, p)} · gross ${usdColored(best.grossUsd)}`);
+              log.info(c.dim(`  skip: ${res.reason}`));
+            }
+            lastSkipped = key;
+            ui.skip = `${label(best)}: ${res.reason}`;
+          } else {
+            lastSkipped = null;
+            ui.skip = null;
+            acted = true;
+            ui.lastTrade = `${hhmm()} ${res.outcome === 'ok' ? 'ok' : 'failed'}`;
+          }
+          if (res.outcome === 'failed') failedInARow += 1;
+          if (res.outcome === 'ok') failedInARow = 0;
           if (failedInARow >= MAX_FAILED_IN_A_ROW) throw new Halt(`${failedInARow} failed arbs in a row`);
         }
 
-        if (acted || tick % config.summaryEvery === 0) {
+        if (acted || (!liveEnabled && tick % config.summaryEvery === 0)) {
           const [b2, p2] = await Promise.all([readBook(chains, w), readPrices(chains)]);
           printBook(b2, p2, ledger);
         }
@@ -174,7 +289,18 @@ async function main(): Promise<void> {
         if (e instanceof Halt) throw e;
         log.error(`tick ${tick}: ${e instanceof Error ? e.message : String(e)}`);
       }
-      if (!stopping) await sleep(config.pollSeconds * 1000);
+      if (!stopping) {
+        ui.phase = 'waiting';
+        ui.nextAt = Date.now() + config.pollSeconds * 1000;
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, config.pollSeconds * 1000);
+          wake = () => {
+            clearTimeout(t);
+            resolve();
+          };
+        });
+        wake = null;
+      }
     }
     log.warn('stopped');
     const [b, pr] = await Promise.all([readBook(chains, w), readPrices(chains)]);
@@ -185,6 +311,7 @@ async function main(): Promise<void> {
       process.exitCode = 2;
     } else throw e;
   } finally {
+    stopLive();
     chains.destroy();
   }
 }

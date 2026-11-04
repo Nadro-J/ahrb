@@ -5,17 +5,16 @@ signs with a mnemonic, keeps inventory on both chains, and only trades when a
 trade still clears every fee.
 
 ```sh
-# once, from the repo root
+# once
 npm install
 
-# run (or put ARB_MNEMONIC in ../.env)
+# run (or put ARB_MNEMONIC in .env)
 ARB_MNEMONIC="word1 word2 … word12" npm start
 ```
 
 `npm start` runs `node --no-opt`. Without that flag, V8's optimizing compiler
 crashes under polkadot-api on Node 20/22 ("Fatal error … unreachable code" in
-`turboshaft::BuildGraph`), the same bug the server works around (see
-`docs/runbook.md`). Don't run `src/main.ts` with plain `tsx` or `node`. When
+`turboshaft::BuildGraph`). Don't run `src/main.ts` with plain `tsx` or `node`. When
 the bot halts (exit code 2), npm also prints its own "npm error" lines; that's
 expected.
 
@@ -70,15 +69,16 @@ market moves left out.
 - **setup / rebalance**: what inventory management cost
 - **market**: the rest, i.e. holding DOT while its price moves
 
-`arb/data/state.json` holds the running totals. `arb/data/ledger.jsonl` has one
+`data/state.json` holds the running totals. `data/ledger.jsonl` has one
 line per action: the expected and realized amounts, the tx hashes, and the
 balances before and after. Delete both files to start a fresh baseline.
 
 ## Stopping
 
 - **Ctrl+C**: finishes the current action, prints the final table, then exits.
-  Press it twice to force.
-- **Kill switch**: `touch arb/data/STOP` (the bot halts at the next tick and
+  Press it twice to force. `SIGTERM` (e.g. `systemctl stop`) and `SIGHUP` (the
+  terminal closing) stop it the same way.
+- **Kill switch**: `touch data/STOP` (the bot halts at the next tick and
   refuses to start while the file exists), or `ARB_KILL=1`.
 - **Automatic halts**: the daily loss limit (`ARB_MAX_DAILY_LOSS_USD`, counting
   arbs and rebalances in the current UTC day), 3 failed arbs in a row, or an XCM
@@ -86,8 +86,56 @@ balances before and after. Delete both files to start a fresh baseline.
 
 ## Settings
 
-All settings come from the environment (or `.env`). The full list with
-defaults is in the root `.env.example` under "Arb bot".
+All settings come from the environment (or `.env`):
+
+| Variable | Default | |
+|---|---|---|
+| `ARB_MNEMONIC` | required | signing account |
+| `ARB_DERIVATION` | none | derivation path |
+| `ARB_MIN_PROFIT_USD` | `0.01` | net profit after tx fees needed to trade |
+| `ARB_MIN_TRADE_USD` | `1` | smallest trade; also the rebalance trigger (a side under 1.5×) |
+| `ARB_MAX_TRADE_USD` | `5` | largest trade; capped in practice by the inventory on each chain |
+| `ARB_MAX_DAILY_LOSS_USD` | `2` | halt when arbs + rebalances lose this much in a UTC day |
+| `ARB_POLL_SECONDS` | `12` | time between checks |
+| `ARB_SUMMARY_EVERY` | `25` | plain mode only: print the balance table every N idle ticks |
+| `ARB_ASSETHUB_RPC` / `ARB_HYDRATION_RPC` | public endpoints | RPC URLs |
+| `ARB_DATA_DIR` | `./data` | ledger, state and the `STOP` file |
+| `ARB_KILL` | none | `1` refuses to run |
+| `ARB_PLAIN` | none | `1` turns off the live status lines |
+
+## Screen output
+
+On a terminal, the bottom of the screen is a live status that redraws in
+place every second instead of printing a line every tick:
+
+```
+● LIVE #482 up 1h36m · DOT $0.9526 AH / $0.9519 HY (-0.07%) · next check 9s
+  nearest trade -$0.0123 DOT/USDT sell AH→buy HY · best since start -$0.0040 at 14:02
+  equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$2) · arbs 0 · last trade none yet
+```
+
+*Nearest trade* is the best candidate this tick, before network fees. It has
+to go positive and then clear the fees plus `ARB_MIN_PROFIT_USD` before
+anything trades. Trades, rebalances, errors and the balance table scroll
+above the status, so the scrollback holds only what happened. The status is
+cut to the terminal width, which keeps it usable from a phone.
+
+When stdout is not a terminal (a log file, systemd/journald) or `ARB_PLAIN=1`,
+it prints one line per tick, as before.
+
+## Running on a server (e.g. a Raspberry Pi over SSH)
+
+Closing the SSH session sends `SIGHUP`. The bot finishes its current action
+and stops. To keep it running after you disconnect, start it inside tmux:
+
+```sh
+tmux new -s arb          # start a session
+npm start                # run the bot
+# detach: Ctrl+B then D. Later, after you SSH back in:
+tmux attach -t arb
+```
+
+The bot warns at startup if it runs over SSH outside tmux or screen.
 
 ## Expect it to sit idle
 

@@ -62,6 +62,14 @@ describe('findOpportunities: cross-chain', () => {
     expect(await findOpportunities(market({}, {}), EVEN, P, LIMITS, null)).toEqual([]);
   });
 
+  it('shows losing candidates to the observer without returning them', async () => {
+    const seen: number[] = [];
+    const opps = await findOpportunities(market({}, {}), EVEN, P, LIMITS, null, (o) => seen.push(o.grossUsd));
+    expect(opps).toEqual([]);
+    expect(seen).toHaveLength(12); // 6 ordered pairs × 2 directions, each stops after its first losing size
+    expect(Math.max(...seen)).toBeLessThan(0);
+  });
+
   it('sells DOT where it is dear and buys it back where it is cheap', async () => {
     // DOT 2 % dearer on Hydration.
     const opps = await findOpportunities(market({}, { DOT: 1.02 }), EVEN, P, LIMITS, null);

@@ -92,9 +92,17 @@ async function quoteXchain(q: Quoter, sellOn: Chain, base: Sym, quote: Sym, size
 /**
  * Every candidate, screened at the smallest size; the ones in profit there
  * are walked up the size ladder and the most profitable size is kept.
- * Candidates the inventory can't fund are skipped.
+ * Candidates the inventory can't fund are skipped. `observe` sees every
+ * fundable quote, losing ones included (the status line shows the closest).
  */
-export async function findOpportunities(q: Quoter, book: Book, p: Prices, l: Limits, psm: PsmState | null): Promise<Opportunity[]> {
+export async function findOpportunities(
+  q: Quoter,
+  book: Book,
+  p: Prices,
+  l: Limits,
+  psm: PsmState | null,
+  observe?: (o: Opportunity) => void
+): Promise<Opportunity[]> {
   const ladder = sizeLadder(l);
   const found: Opportunity[] = [];
 
@@ -103,6 +111,7 @@ export async function findOpportunities(q: Quoter, book: Book, p: Prices, l: Lim
     for (const usd of sizes) {
       const o = await quoteAt(usd).catch(() => null);
       if (!o || !fits(o)) break; // bigger only gets worse once inventory or the pools run out
+      observe?.(o);
       if (o.grossUsd <= 0) break; // slippage grows with size: past break-even it never comes back
       if (!top || o.grossUsd > top.grossUsd) top = o;
     }
@@ -160,6 +169,12 @@ export async function findOpportunities(q: Quoter, book: Book, p: Prices, l: Lim
   }
 
   return found.sort((a, b) => b.grossUsd - a.grossUsd);
+}
+
+/** A few words naming the candidate, for the status line. */
+export function label(o: Opportunity): string {
+  if (o.kind === 'xchain') return `${o.base}/${o.quote} sell ${o.sellOn}→buy ${o.buyOn}`;
+  return o.kind;
 }
 
 export function describe(o: Opportunity, p: Prices): string {
