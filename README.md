@@ -23,6 +23,67 @@ address is printed at startup, and it is the same account your wallet
 extension shows for that mnemonic (sr25519, no derivation path unless you set
 `ARB_DERIVATION`).
 
+## How it works (picture version)
+
+The bot keeps a little of each coin on both chains. When the same coin is
+cheaper on one chain than on the other, it sells where it's dear and buys back
+where it's cheap, both at once. It ends up holding the same coins plus a few
+cents.
+
+```mermaid
+sequenceDiagram
+    participant AH as Asset Hub
+    participant Bot as Bot (your account)
+    participant HY as Hydration
+    Note over AH,HY: Example: DOT is $0.960 on Asset Hub and $0.945 on Hydration
+    par at the same time
+        Bot->>AH: sell 2 DOT (dear here)
+        AH-->>Bot: 1.92 USDT
+    and
+        Bot->>HY: pay 1.89 USDT
+        HY-->>Bot: 2 DOT (cheap here)
+    end
+    Note over Bot: still 2 DOT on each side, plus 0.03 USDT
+    Bot-->>HY: XCM top-up, only when one side runs low (about $0.03)
+```
+
+Result: 1.92 − 1.89 = **0.03 USDT** profit before network fees.
+
+### Every tick
+
+```mermaid
+flowchart TD
+    A(["tick: every ARB_POLL_SECONDS"]) --> K{"STOP file, daily loss limit<br/>or 3 failed arbs in a row?"}
+    K -- yes --> H(["halt (exit 2)"])
+    K -- no --> B["read balances and prices on both chains"]
+    B --> R{"a side too thin to trade?<br/>(under 1.5 × ARB_MIN_TRADE_USD)"}
+    R -- yes --> X["XCM: move it back to a 50/50 split"] --> Q
+    R -- no --> Q["quote every candidate:<br/>12 cross-chain + PSM mint/redeem<br/>at sizes $1, $1.5, $2 … up to ARB_MAX_TRADE_USD"]
+    Q --> G{"best gross profit > 0?<br/>(pool fees already included)"}
+    G -- no --> W["wait (the status line shows the nearest trade)"]
+    G -- yes --> F{"gross − network fees<br/>≥ ARB_MIN_PROFIT_USD?"}
+    F -- no --> W
+    F -- yes --> D["dry-run both legs, then send them together<br/>with slippage limits"]
+    D --> M["measure balances before vs after → ledger"]
+    M --> W
+    W --> A
+```
+
+### When a trade is worth it
+
+Each check has to pass before anything is sent:
+
+```mermaid
+flowchart LR
+    S["price gap between chains"] -->|"minus pool fees<br/>(~0.3 % each swap)"| G["gross"]
+    G -->|"minus network fees<br/>(both chains)"| N["net"]
+    N -->|"must be ≥ ARB_MIN_PROFIT_USD<br/>($0.01 by default)"| T["trade"]
+    T -->|"slippage limits keep<br/>at least 20 % of net"| P["worst case: ≥ $0.002"]
+```
+
+Spreads big enough to pass are rare, so expect the bot to sit idle most of the
+time (see [Expect it to sit idle](#expect-it-to-sit-idle)).
+
 ## What it does
 
 **1. Setup (first run only).** It turns the deposit into even inventory: about
@@ -102,6 +163,7 @@ All settings come from the environment (or `.env`):
 | `ARB_DATA_DIR` | `./data` | ledger, state and the `STOP` file |
 | `ARB_KILL` | none | `1` refuses to run |
 | `ARB_PLAIN` | none | `1` turns off the live status lines |
+| `ARB_CHART_MINUTES` | `5` | how much history the live charts show; `0` hides them |
 
 ## Screen output
 
@@ -109,10 +171,25 @@ On a terminal, the bottom of the screen is a live status that redraws in
 place every second instead of printing a line every tick:
 
 ```
-● LIVE #482 up 1h36m · DOT $0.9526 AH / $0.9519 HY (-0.07%) · next check 9s
+● LIVE #482 up 1h36m · DOT $0.9526 AH / $0.9519 HY (-0.07%) · next check 4s
   nearest trade -$0.0123 DOT/USDT sell AH→buy HY · best since start -$0.0040 at 14:02
-  equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$2) · arbs 0 · last trade none yet
+  equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$0.5) · arbs 0 · last trade none yet
+  ── last 5 min ───────────────────────────────────
+  DOT AH   ▅▆▆▆▇▇▇███████▇▇▇▆▆▅▅▄▄▄▃▃▃▃▃▂▃▃▃▃▃▄▄▅▅▆▆▆▇  $0.9501–$0.9532
+  DOT HY   ▄▅▅▆▇▇████▇▇▆▅▄▄▃▃▂▂▂▂▂▃▃▃▃▃▃▃▂▂▂▁▁▁▁▁▂▂▃▃▄  same scale
+  spread   ▅▅▆▇▇███▇▇▆▅▄▃▂▁▁▁▁▂▃▄▄▅▆▇████▇▆▅▄▃▃▂▁▁▁▁▂▃  -0.17% … +0.02%
+  nearest  ▄▄▅▅▅▆▆▆▆▆▆▅▅▄▃▃▂▂▁▁▁▁▁▁▂▂▃▃▄▄▅▆▆▆██▇▅▅▅▄▄▃  -$0.045 … +$0.010 (green > 0)
 ```
+
+How to read the charts (one bar per tick, newest on the right):
+
+- **DOT AH / DOT HY**: DOT's price on each chain, on one shared scale, so the
+  gap between the two lines is the arbitrage gap.
+- **spread**: Hydration's DOT price minus Asset Hub's, in %. The bot needs
+  roughly ±0.6–0.8 % before a cross-chain trade pays.
+- **nearest**: the best candidate's gross profit each tick. Its range always
+  includes $0, and bars above $0 are green. Green bars that don't lead to a
+  trade were eaten by network fees or the profit floor.
 
 *Nearest trade* is the best candidate this tick, before network fees. It has
 to go positive and then clear the fees plus `ARB_MIN_PROFIT_USD` before
@@ -171,5 +248,6 @@ does not create trades: the hard floor is still "net > fees".
 | `src/venues.ts` | Asset Hub pools + PSM, Hydration router, XCM builders |
 | `src/chains.ts` | connections, key, balances, prices, dry-run-then-send |
 | `src/pnl.ts` | ledger and P&L split |
+| `src/log.ts`, `src/chart.ts` | output, the live status region, sparklines |
 
 `npm test` runs the specs (no network).

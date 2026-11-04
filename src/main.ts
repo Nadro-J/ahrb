@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { CHAIN_NAME, human, SYMS, type Chain } from './assets.js';
 import { connect, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
 import { bootstrap, dotPrices, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
+import { extent, sparkline } from './chart.js';
 import { c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
 import { Ledger } from './pnl.js';
 import { describe, findOpportunities, label, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
@@ -45,6 +46,7 @@ const config = {
   maxDailyLossUsd: num('ARB_MAX_DAILY_LOSS_USD', 2),
   pollSeconds: num('ARB_POLL_SECONDS', 12),
   summaryEvery: num('ARB_SUMMARY_EVERY', 25),
+  chartMinutes: num('ARB_CHART_MINUTES', 5),
 };
 
 const MAX_FAILED_IN_A_ROW = 3;
@@ -77,6 +79,41 @@ const ui = {
   arbs: { done: 0, failed: 0 },
   lastTrade: null as string | null,
 };
+
+/** One sample per tick for the live charts, trimmed to the last `ARB_CHART_MINUTES`. */
+const history: { t: number; ah: number; hy: number | null; near: number | null }[] = [];
+
+function recordSample(ah: number, hy: number | null, near: number | null): void {
+  const now = Date.now();
+  history.push({ t: now, ah, hy, near });
+  while (history.length && history[0]!.t < now - config.chartMinutes * 60_000) history.shift();
+}
+
+/** Sparklines of the last few minutes: DOT on both chains (shared scale), the spread, and the nearest trade vs zero. */
+function renderCharts(): string[] {
+  if (!config.chartMinutes || history.length < 2) return [];
+  const width = Math.max(10, Math.min(120, (process.stdout.columns || 80) - 1 - 11 - 26));
+  const ah = history.map((h) => h.ah);
+  const hy = history.map((h) => h.hy);
+  const spread = history.map((h) => (h.hy ? ((h.hy - h.ah) / h.ah) * 100 : null));
+  const near = history.map((h) => h.near);
+  const px = extent([...ah, ...hy]);
+  const sp = extent(spread, 0);
+  const nr = extent(near, 0);
+  const row = (name: string, chart: string, legend: string) => `  ${c.dim(name.padEnd(9))}${chart}  ${c.dim(legend)}`;
+  const mins = Math.round((history.at(-1)!.t - history[0]!.t) / 60_000);
+  const lines = [c.dim(`  ── last ${mins < 1 ? '<1' : mins} min ${'─'.repeat(Math.max(0, width - 8))}`)];
+  if (px) {
+    lines.push(row('DOT AH', c.cyan(sparkline(ah, width, px)), `$${px[0].toFixed(4)}–$${px[1].toFixed(4)}`));
+    lines.push(row('DOT HY', c.magenta(sparkline(hy, width, px)), 'same scale'));
+  }
+  if (sp) lines.push(row('spread', sparkline(spread, width, sp), `${sp[0].toFixed(2)}% … ${sp[1] >= 0 ? '+' : ''}${sp[1].toFixed(2)}%`));
+  if (nr) {
+    const bars = sparkline(near, width, nr, (bar, v) => (v > 0 ? c.green(bar) : c.dim(bar)));
+    lines.push(row('nearest', bars, `${usd(nr[0], 3)} … ${usd(nr[1], 3)} (green > 0)`));
+  }
+  return lines;
+}
 
 const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 const hhmm = () => new Date().toISOString().slice(11, 16);
@@ -113,7 +150,7 @@ function renderLive(): string[] {
 
   const lines = [line1, line2, line3];
   if (ui.skip) lines.push(c.dim(`  skipping: ${ui.skip}`));
-  return lines;
+  return [...lines, ...renderCharts()];
 }
 
 function printBook(book: Book, p: Prices, ledger: Ledger): void {
@@ -246,6 +283,7 @@ async function main(): Promise<void> {
         ui.dot = dot;
         const near = closest as Opportunity | null;
         ui.closest = near ? { what: label(near), gross: near.grossUsd } : null;
+        recordSample(dot.ah, dot.hy, near?.grossUsd ?? null);
         if (near && (!ui.record || near.grossUsd > ui.record.gross)) ui.record = { what: label(near), gross: near.grossUsd, at: hhmm() };
 
         const spread = dot.hy ? ((dot.hy - dot.ah) / dot.ah) * 100 : null;
