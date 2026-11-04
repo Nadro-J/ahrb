@@ -7,7 +7,7 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "node --no-opt --env-file-if-exists=.env --env-file-if-exists=../.env --import tsx src/main.ts",
+    "start": "node --no-opt --env-file-if-exists=.env --import tsx src/main.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
