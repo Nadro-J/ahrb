@@ -18,12 +18,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHAIN_NAME, human, SYMS, type Chain } from './assets.js';
 import { connect, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
-import { bootstrap, dotPrices, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
-import { barPlot, extent, linePlot, sparklineIn } from './chart.js';
-import { ascii, c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
+import { bootstrap, dotPrices, typicalXchainFees, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
+import { noteEthWatch, recordSample, renderLive, settings, hhmm, ui } from './dashboard.js';
+import { c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
 import { Ledger } from './pnl.js';
-import { describe, findOpportunities, label, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
-import { ahQuoteIn, ahQuoteOut, hyBuy, hySell, psmState } from './venues.js';
+import { describe, findOpportunities, label, planRebalance, watchEth, type EthQuoter, type Limits, type Opportunity, type Quoter } from './strategy.js';
+import { ahQuoteIn, ahQuoteOut, ethQuoter, hyBuy, hySell, psmState } from './venues.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const num = (name: string, fallback: number) => {
@@ -48,9 +48,20 @@ const config = {
   summaryEvery: num('ARB_SUMMARY_EVERY', 25),
   chartMinutes: num('ARB_CHART_MINUTES', 5),
   chartHeight: num('ARB_CHART_HEIGHT', 8),
+  boardRows: num('ARB_BOARD_ROWS', 5),
+  watchEth: process.env.ARB_WATCH_ETH !== '0',
 };
 
 const MAX_FAILED_IN_A_ROW = 3;
+
+Object.assign(settings, {
+  chartMinutes: config.chartMinutes,
+  chartHeight: config.chartHeight,
+  boardRows: config.boardRows,
+  watchEth: config.watchEth,
+  minProfitUsd: config.minProfitUsd,
+  maxDailyLossUsd: config.maxDailyLossUsd,
+});
 
 function killSwitch(): string | null {
   if (process.env.ARB_KILL === '1') return 'ARB_KILL=1';
@@ -58,147 +69,6 @@ function killSwitch(): string | null {
   return null;
 }
 
-/* ---------------------------------------------------------- live status */
-
-type Phase = 'starting' | 'rebalancing' | 'quoting' | 'trading' | 'waiting' | 'stopping';
-
-/** What the live status region shows; updated by the loop, drawn every second by log.ts. */
-const ui = {
-  started: Date.now(),
-  tick: 0,
-  phase: 'starting' as Phase,
-  nextAt: 0,
-  dot: null as { ah: number; hy: number | null } | null,
-  /** The best candidate this tick, losing or not (gross, before tx fees). */
-  closest: null as { what: string; gross: number } | null,
-  /** The best candidate seen since start. */
-  record: null as { what: string; gross: number; at: string } | null,
-  skip: null as string | null,
-  equity: 0,
-  pnl: 0,
-  day: 0,
-  arbs: { done: 0, failed: 0 },
-  lastTrade: null as string | null,
-};
-
-/** One sample per tick for the live charts, trimmed to the last `ARB_CHART_MINUTES`. */
-const history: { t: number; ah: number; hy: number | null; near: number | null }[] = [];
-
-function recordSample(ah: number, hy: number | null, near: number | null): void {
-  const now = Date.now();
-  history.push({ t: now, ah, hy, near });
-  while (history.length && history[0]!.t < now - config.chartMinutes * 60_000) history.shift();
-}
-
-const charset = ascii ? 'ascii' : 'unicode';
-
-/** How far back the history goes, as an axis label: "-45s", "-5m". */
-function span(): string {
-  const secs = Math.round((history.at(-1)!.t - history[0]!.t) / 1000);
-  return secs < 90 ? `-${secs}s` : `-${Math.round(secs / 60)}m`;
-}
-
-/**
- * Charts of the last few minutes, sized to the terminal:
- *  - big (ARB_CHART_HEIGHT ≥ 3 and room on screen): DOT price on both chains
- *    as a line plot, and the nearest trade as bars around $0;
- *  - compact: one-line sparklines for price, spread and nearest trade;
- *  - none, when even that doesn't fit.
- * `statusRows` is what the status lines above already use; a few rows are left
- * free so the latest log lines stay visible.
- */
-function renderCharts(statusRows: number): string[] {
-  if (!config.chartMinutes || history.length < 2) return [];
-  const cols = (process.stdout.columns || 80) - 1;
-  const free = (process.stdout.rows || 24) - 1 - statusRows - 6;
-  const ah = history.map((h) => h.ah);
-  const hy = history.map((h) => h.hy);
-  const near = history.map((h) => h.near);
-  const nearPaint = (bar: string, v: number) => (v > 0 ? c.green(bar) : c.dim(bar));
-
-  // Big: title + plot + 2 axis rows, twice.
-  const labelWidth = 10;
-  const width = Math.max(10, Math.min(history.length, cols - labelWidth - 2));
-  // Shrink the plots until both fit: each has a title row, its own rows and two axis rows.
-  const nearRows = (h: number) => Math.max(3, Math.round(h * 0.6));
-  let priceH = Math.floor(config.chartHeight);
-  while (priceH >= 3 && 3 + priceH + 3 + nearRows(priceH) > free) priceH -= 1;
-  const nearH = nearRows(priceH);
-  if (priceH >= 3) {
-    const opts = { charset, labelWidth, leftLabel: span() } as const;
-    const ahMark = c.cyan(ascii ? 'o' : '●');
-    const hyMark = c.magenta(ascii ? 'x' : '●');
-    return [
-      `  ${c.bold('DOT price')}   ${ahMark} Asset Hub   ${hyMark} Hydration   ${c.dim(`${ascii ? '@' : '◆'} both`)}`,
-      ...linePlot(
-        [
-          { values: ah, mark: ascii ? 'o' : '●', paint: c.cyan },
-          { values: hy, mark: ascii ? 'x' : '●', paint: c.magenta },
-        ],
-        width,
-        priceH,
-        (v) => `$${v.toFixed(4)}`,
-        opts
-      ).map((r, i, all) => (i >= all.length - 2 ? c.dim(r) : r)),
-      `  ${c.bold('nearest trade')} ${c.dim('gross, before network fees · trades only above $0 + fees')}`,
-      ...barPlot(near, width, nearH, (v) => usd(v, 3), { ...opts, paint: nearPaint }).map((r, i, all) =>
-        i >= all.length - 2 ? c.dim(r) : r
-      ),
-    ];
-  }
-
-  // Compact: a heading and three sparklines.
-  if (free < 4) return [];
-  const sw = Math.max(10, Math.min(120, cols - 11 - 26));
-  const spread = history.map((h) => (h.hy ? ((h.hy - h.ah) / h.ah) * 100 : null));
-  const px = extent([...ah, ...hy]);
-  const sp = extent(spread, 0);
-  const nr = extent(near, 0);
-  const row = (name: string, chart: string, legend: string) => `  ${c.dim(name.padEnd(9))}${chart}  ${c.dim(legend)}`;
-  const lines = [c.dim(`  ── last ${span().slice(1)} ${'─'.repeat(Math.max(0, sw - 8))}`)];
-  if (px) lines.push(row('DOT AH/HY', c.cyan(sparklineIn(charset, ah, sw, px)), `$${px[0].toFixed(4)}–$${px[1].toFixed(4)}`));
-  if (sp) lines.push(row('spread', sparklineIn(charset, spread, sw, sp), `${sp[0].toFixed(2)}% … ${sp[1] >= 0 ? '+' : ''}${sp[1].toFixed(2)}%`));
-  if (nr) lines.push(row('nearest', sparklineIn(charset, near, sw, nr, nearPaint), `${usd(nr[0], 3)} … ${usd(nr[1], 3)} (green > 0)`));
-  return lines;
-}
-
-const SPIN = ascii ? '|/-\\' : '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
-const hhmm = () => new Date().toISOString().slice(11, 16);
-
-function ago(ms: number): string {
-  const m = Math.floor(ms / 60_000);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return h < 24 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${Math.floor(h / 24)}d${h % 24}h`;
-}
-
-function renderLive(): string[] {
-  const busy = ui.phase !== 'waiting';
-  const pulse = busy ? c.cyan(SPIN[Math.floor(Date.now() / 250) % SPIN.length]!) : c.green('●');
-  const doing = busy ? c.cyan(ui.phase) : c.dim(`next check ${Math.max(0, Math.ceil((ui.nextAt - Date.now()) / 1000))}s`);
-  let dot = '';
-  if (ui.dot) {
-    const { ah, hy } = ui.dot;
-    const spread = hy ? ((hy - ah) / ah) * 100 : null;
-    dot = ` · DOT ${c.cyan('$' + ah.toFixed(4))} AH / ${c.cyan(hy ? '$' + hy.toFixed(4) : '?')} HY`;
-    if (spread !== null) dot += c.dim(` (${spread >= 0 ? '+' : ''}${spread.toFixed(2)}%)`);
-  }
-  const line1 = `${pulse} ${c.bold('LIVE')} #${ui.tick} ${c.dim('up ' + ago(Date.now() - ui.started))}${dot} · ${doing}`;
-
-  const near = ui.closest ? `${usdColored(ui.closest.gross)} ${c.dim(ui.closest.what)}` : c.dim('—');
-  const rec = ui.record ? ` · best since start ${usdColored(ui.record.gross)} ${c.dim('at ' + ui.record.at)}` : '';
-  const line2 = `  nearest trade ${near}${rec}`;
-
-  const line3 =
-    `  equity $${ui.equity.toFixed(2)} · P&L ${usdColored(ui.pnl, 2)} · today ${usdColored(ui.day, 2)}` +
-    c.dim(` (halt at −$${config.maxDailyLossUsd})`) +
-    ` · arbs ${ui.arbs.done}${ui.arbs.failed ? c.red(` (${ui.arbs.failed} failed)`) : ''}` +
-    c.dim(` · last trade ${ui.lastTrade ?? 'none yet'}`);
-
-  const lines = [line1, line2, line3];
-  if (ui.skip) lines.push(c.dim(`  skipping: ${ui.skip}`));
-  return [...lines, ...renderCharts(lines.length)];
-}
 
 function printBook(book: Book, p: Prices, ledger: Ledger): void {
   const cols = [...SYMS, 'dotUSD', 'HDX'] as const;
@@ -290,6 +160,7 @@ async function main(): Promise<void> {
       hySell: async (from, to, amount) => (await hySell(chains, from, to, amount))?.amountOut ?? null,
       hyBuy: async (from, to, amount) => (await hyBuy(chains, from, to, amount))?.amountIn ?? null,
     };
+    const ethQ: EthQuoter = ethQuoter(chains);
     printBook(book, p, ledger);
 
     if (!ledger.state.bootstrapped) await bootstrap(ctx);
@@ -322,15 +193,28 @@ async function main(): Promise<void> {
 
         ui.phase = 'quoting';
         let closest: Opportunity | null = null;
+        const cands: Record<string, number> = {};
         const observe = (o: Opportunity) => {
           if (!closest || o.grossUsd > closest.grossUsd) closest = o;
+          const k = label(o);
+          cands[k] = Math.max(cands[k] ?? -Infinity, o.grossUsd);
         };
+        if (Date.now() - ui.feesAt > 10 * 60_000) {
+          ui.feesAt = Date.now();
+          ui.fees = (await typicalXchainFees(ctx, p).catch(() => null)) ?? ui.fees;
+        }
         const psm = await psmState(chains).catch(() => null);
-        const [opps, dot] = await Promise.all([findOpportunities(quoter, book, p, limits, psm, observe), dotPrices(ctx, p)]);
+        const [opps, dot, eth] = await Promise.all([
+          findOpportunities(quoter, book, p, limits, psm, observe),
+          dotPrices(ctx, p),
+          config.watchEth ? watchEth(ethQ, p, limits).catch(() => []) : Promise.resolve([]),
+        ]);
         ui.dot = dot;
         const near = closest as Opportunity | null;
         ui.closest = near ? { what: label(near), gross: near.grossUsd } : null;
-        recordSample(dot.ah, dot.hy, near?.grossUsd ?? null);
+        for (const e of eth) cands[`${e.label} (watch)`] = e.grossUsd;
+        recordSample(dot.ah, dot.hy, near?.grossUsd ?? null, cands);
+        noteEthWatch(eth[0]);
         if (near && (!ui.record || near.grossUsd > ui.record.gross)) ui.record = { what: label(near), gross: near.grossUsd, at: hhmm() };
 
         const spread = dot.hy ? ((dot.hy - dot.ah) / dot.ah) * 100 : null;

@@ -56,8 +56,8 @@ export function sparkline(
 export type Charset = 'unicode' | 'ascii';
 
 const GLYPHS = {
-  unicode: { axis: '┤', corner: '└', rule: '─', zero: '┄', bar: '█', overlap: '◆', spark: BARS },
-  ascii: { axis: '|', corner: '+', rule: '-', zero: '-', bar: '#', overlap: '@', spark: '.:-=+*#@' },
+  unicode: { axis: '┤', corner: '└', rule: '─', zero: '┄', bar: '█', overlap: '◆', line: '┈', spark: BARS },
+  ascii: { axis: '|', corner: '+', rule: '-', zero: '-', bar: '#', overlap: '@', line: '.', spark: '.:-=+*#@' },
 };
 
 export interface Series {
@@ -122,16 +122,25 @@ export function linePlot(
 /**
  * Bars growing up or down from a zero line, `height` rows tall. The range
  * always includes 0, and the y axis labels the top, the zero line and the
- * bottom. Positive bars start on the zero line, so even a tiny one shows;
- * negative bars hang below it and leave the line visible. `paint` colours a
- * bar by its value (e.g. green above 0).
+ * bottom. Positive bars start on the zero line and negative bars hang below
+ * it, at least one cell each, so even a tiny value shows and the line stays
+ * visible. `paint` colours a
+ * bar by its value (e.g. green above 0). `threshold` draws a dotted line at
+ * that value when it falls inside the data's range (stretching the range to
+ * reach a far-off line would flatten the bars into one row).
  */
 export function barPlot(
   values: (number | null)[],
   width: number,
   height: number,
   fmtY: (v: number) => string,
-  opts: { charset: Charset; labelWidth: number; leftLabel: string; paint?: (s: string, v: number) => string }
+  opts: {
+    charset: Charset;
+    labelWidth: number;
+    leftLabel: string;
+    paint?: (s: string, v: number) => string;
+    threshold?: { value: number; paint?: (s: string) => string };
+  }
 ): string[] {
   const g = GLYPHS[opts.charset];
   const vals = resample(values, width);
@@ -141,15 +150,19 @@ export function barPlot(
   if (max === min) [min, max] = [min - 1, max + 1];
   const rowOf = (v: number) => Math.round(((max - v) / (max - min)) * (height - 1));
   const zero = rowOf(0);
-  const grid: string[][] = Array.from({ length: height }, (_, y) => Array(width).fill(y === zero ? g.zero : ' '));
+  const t = opts.threshold?.value;
+  const line = t !== undefined && t >= min && t <= max && rowOf(t) !== zero ? rowOf(t) : -1;
+  const lineMark = (opts.threshold?.paint ?? id)(g.line);
+  const grid: string[][] = Array.from({ length: height }, (_, y) => Array(width).fill(y === zero ? g.zero : y === line ? lineMark : ' '));
   vals.forEach((v, x) => {
-    if (v === null) return;
+    if (v === null || v === 0) return; // exactly $0 is the line itself
     const y = rowOf(v);
-    const [from, to] = v > 0 ? [y, zero] : [zero + 1, y];
+    // Every bar gets at least one cell: a small loss still shows just under the line.
+    const [from, to] = v > 0 ? [y, zero] : [zero + 1, Math.max(y, zero + 1)];
     for (let r = from; r <= to; r++) grid[r]![x] = (opts.paint ? (s: string) => opts.paint!(s, v) : id)(g.bar);
   });
   const labels = grid.map((_, row) => {
-    const v = row === 0 ? max : row === zero ? 0 : row === height - 1 ? min : null;
+    const v = row === zero ? 0 : row === line ? opts.threshold!.value : row === 0 ? max : row === height - 1 ? min : null;
     return (v === null ? '' : fmtY(v)).padStart(opts.labelWidth);
   });
   return [...grid.map((r, i) => `${labels[i]} ${g.axis}${r.join('')}`), ...xAxis(width, opts.labelWidth, opts.leftLabel, opts.charset).split('\n')];

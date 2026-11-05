@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Sym } from './assets.js';
 import type { Book, Prices } from './chains.js';
-import { findOpportunities, planRebalance, RESERVE, sizeLadder, tradeable, type Quoter } from './strategy.js';
+import { findOpportunities, planRebalance, RESERVE, sizeLadder, tradeable, watchEth, type EthQuoter, type Quoter } from './strategy.js';
 import { psmFee, type AhSym, type PsmState } from './venues.js';
 
 const P: Prices = { DOT: 1, USDT: 1, USDC: 1, dotUSD: 1, HDX: 0.01 };
@@ -174,5 +174,32 @@ describe('planRebalance', () => {
     expect(plans[0]!.from).toBe('HY');
     expect(plans[0]!.items.map((i) => i.sym)).toEqual(['DOT', 'USDT', 'USDC']);
     expect(planRebalance(book([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]), P, LIMITS)).toEqual([]);
+  });
+});
+
+describe('watchEth', () => {
+  // ETH at $2000 against DOT at $1; `hyPremium` makes ETH dearer on Hydration. Each leg costs `fee`.
+  const quoter = (hyPremium: number, fee = 0.003): EthQuoter => {
+    const dot = (usd: number) => BigInt(Math.round(usd * 1e10));
+    const usdOf = (eth: bigint, px: number) => (Number(eth) / 1e18) * px;
+    return {
+      ahSellEth: async (e) => dot(usdOf(e, 2000) * (1 - fee)),
+      ahBuyEth: async (e) => dot(usdOf(e, 2000) / (1 - fee)),
+      hySellEth: async (e) => dot(usdOf(e, 2000 * (1 + hyPremium)) * (1 - fee)),
+      hyBuyEth: async (e) => dot(usdOf(e, 2000 * (1 + hyPremium)) / (1 - fee)),
+    };
+  };
+
+  it('reports both directions, losing ones at the smallest size', async () => {
+    const w = await watchEth(quoter(0), P, LIMITS);
+    expect(w.map((x) => x.label).sort()).toEqual(['ETH/DOT sell AH→buy HY', 'ETH/DOT sell HY→buy AH']);
+    expect(w.every((x) => x.grossUsd < 0 && x.sizeUsd === 1)).toBe(true);
+  });
+
+  it('sells where ETH is dear and walks up the ladder while it pays', async () => {
+    const [best] = await watchEth(quoter(0.02), P, LIMITS);
+    expect(best!.label).toBe('ETH/DOT sell HY→buy AH');
+    expect(best!.grossUsd).toBeGreaterThan(0);
+    expect(best!.sizeUsd).toBe(5);
   });
 });

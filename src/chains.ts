@@ -85,6 +85,15 @@ export async function connect(ahRpc: string, hyRpc: string): Promise<Chains> {
   };
 }
 
+/**
+ * Read state at the newest block. polkadot-api defaults to the finalized
+ * block, 2–3 blocks (~12–18 s) behind. Quoting from there shows spreads that
+ * another trader has already closed in a newer block, and the swap then fails
+ * on chain (AssetConversion.ProvidedMinimumNotSufficientForSwap) after paying
+ * its fee.
+ */
+export const BEST = { at: 'best' } as const;
+
 /* ------------------------------------------------------------------ balances */
 
 /** Spendable balances per chain, native units. `dotUSD` only exists on AH, `HDX` only on HY. */
@@ -92,15 +101,15 @@ export type Book = Record<Chain, Record<Sym | 'dotUSD' | 'HDX', bigint>>;
 
 export async function readBook(c: Chains, w: Wallet): Promise<Book> {
   const ahAsset = (index: number) =>
-    c.ah.query.Assets.Account.getValue(index, w.ah).then((a: { balance: bigint } | undefined) => a?.balance ?? 0n);
+    c.ah.query.Assets.Account.getValue(index, w.ah, BEST).then((a: { balance: bigint } | undefined) => a?.balance ?? 0n);
   const hyToken = (id: number) =>
-    c.hy.query.Tokens.Accounts.getValue(w.hy, id).then((a: { free: bigint; frozen: bigint }) => a.free - a.frozen);
+    c.hy.query.Tokens.Accounts.getValue(w.hy, id, BEST).then((a: { free: bigint; frozen: bigint }) => a.free - a.frozen);
   const [ahSys, ahUsdt, ahUsdc, ahDotUsd, hySys, hyDot, hyUsdt, hyUsdc] = await Promise.all([
-    c.ah.query.System.Account.getValue(w.ah),
+    c.ah.query.System.Account.getValue(w.ah, BEST),
     ahAsset(ASSETS.USDT.ahIndex!),
     ahAsset(ASSETS.USDC.ahIndex!),
     ahAsset(DOTUSD.index),
-    c.hy.query.System.Account.getValue(w.hy),
+    c.hy.query.System.Account.getValue(w.hy, BEST),
     hyToken(ASSETS.DOT.hyId),
     hyToken(ASSETS.USDT.hyId),
     hyToken(ASSETS.USDC.hyId),
@@ -123,7 +132,7 @@ export interface Prices {
 
 export async function readPrices(c: Chains): Promise<Prices> {
   const [reserves, hdx] = await Promise.all([
-    c.ah.apis.AssetConversionApi.get_reserves(ASSETS.DOT.ahLocation, ASSETS.USDT.ahLocation) as Promise<[bigint, bigint] | undefined>,
+    c.ah.apis.AssetConversionApi.get_reserves(ASSETS.DOT.ahLocation, ASSETS.USDT.ahLocation, BEST) as Promise<[bigint, bigint] | undefined>,
     c.sdk.api.router.getSpotPrice(HDX.id, ASSETS.USDT.hyId).catch(() => undefined),
   ]);
   if (!reserves) throw new Error('Asset Hub DOT/USDT pool has no reserves');
@@ -173,7 +182,7 @@ export function errorText(e: unknown): string {
 
 /** DryRunApi.dry_run_call; throws with the dispatch error when the call would fail. */
 export async function dryRun(api: Unsafe, address: string, tx: Tx): Promise<{ events: Array<{ type: string; value: { type: string; value: unknown } }> }> {
-  const res = await api.apis.DryRunApi.dry_run_call(Enum('system', Enum('Signed', address)), tx.decodedCall, 5);
+  const res = await api.apis.DryRunApi.dry_run_call(Enum('system', Enum('Signed', address)), tx.decodedCall, 5, BEST);
   if (!res.success) throw new Error(`dry run could not run (${res.value?.type ?? 'unknown'})`);
   if (!res.value.execution_result.success) throw new Error(`dry run failed: ${errorText(res.value.execution_result.value.error)}`);
   return { events: res.value.emitted_events };

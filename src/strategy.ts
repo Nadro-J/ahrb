@@ -224,3 +224,53 @@ export function planRebalance(book: Book, p: Prices, l: Limits): RebalancePlan[]
   }
   return [plans.AH, plans.HY].filter((pl) => pl.items.length > 0);
 }
+
+/* ------------------------------------------------------- ETH (watch only) */
+
+/** Quotes for the DOT/ETH round trip. Amounts: ETH in wei (18 dp), DOT in planck (10 dp). */
+export interface EthQuoter {
+  ahSellEth(eth: bigint): Promise<bigint | null>;
+  ahBuyEth(eth: bigint): Promise<bigint | null>;
+  hySellEth(eth: bigint): Promise<bigint | null>;
+  hyBuyEth(eth: bigint): Promise<bigint | null>;
+}
+
+export interface Watched {
+  label: string;
+  /** Gross profit in USD (pool fees included, network fees not). */
+  grossUsd: number;
+  sizeUsd: number;
+}
+
+/**
+ * The ETH/DOT cross-chain round trip in both directions, as the bot would
+ * trade it: sell ETH for DOT on one chain, buy the same ETH back with DOT on
+ * the other. Watch only: no inventory check, nothing is executed. Each
+ * direction keeps its best size from the ladder; a losing one stays at the
+ * smallest size, so the status can show how far off it is.
+ */
+export async function watchEth(q: EthQuoter, p: Prices, l: Limits): Promise<Watched[]> {
+  const probe = 10n ** 15n; // 0.001 ETH
+  const probeDot = await q.ahSellEth(probe).catch(() => null);
+  if (!probeDot) return [];
+  const ethUsd = (Number(probeDot) / 1e10) * p.DOT * 1000;
+  const out: Watched[] = [];
+  const legs = [
+    { label: 'ETH/DOT sell HY→buy AH', sell: q.hySellEth, buy: q.ahBuyEth },
+    { label: 'ETH/DOT sell AH→buy HY', sell: q.ahSellEth, buy: q.hyBuyEth },
+  ];
+  for (const leg of legs) {
+    let top: Watched | null = null;
+    for (const usd of sizeLadder(l)) {
+      const eth = BigInt(Math.round((usd / ethUsd) * 1e18));
+      const [got, paid] = await Promise.all([leg.sell(eth).catch(() => null), leg.buy(eth).catch(() => null)]);
+      if (!got || !paid) break;
+      const w = { label: leg.label, grossUsd: (Number(got - paid) / 1e10) * p.DOT, sizeUsd: usd };
+      if (top && w.grossUsd <= top.grossUsd) break;
+      top = w;
+      if (w.grossUsd <= 0) break;
+    }
+    if (top) out.push(top);
+  }
+  return out.sort((a, b) => b.grossUsd - a.grossUsd);
+}

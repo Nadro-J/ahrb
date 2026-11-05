@@ -13,6 +13,7 @@ npm test                           # vitest, specs only, no network
 npx vitest run src/strategy.spec.ts            # one spec file
 npx vitest run -t "size ladder"                # tests matching a name
 npm run typecheck                  # tsc --noEmit
+npm run preview                    # draw the live status once from fake data (no network); COLUMNS/LINES/ARB_ASCII vary it
 ```
 
 - Always start through `npm start`. `--no-opt` works around a V8 optimizing-compiler crash under polkadot-api on Node 20/22. Running `src/main.ts` with plain `tsx` or `node` crashes.
@@ -21,13 +22,14 @@ npm run typecheck                  # tsc --noEmit
 
 ## Architecture
 
-Every 12 s tick in `main.ts`: read balances (`Book`) and USD prices on both chains → `planRebalance` (XCM only if a side is too thin to trade) → `findOpportunities` → `executeArb` on the single best candidate → print the P&L table.
+Every tick in `main.ts` (`ARB_POLL_SECONDS`): read balances (`Book`) and USD prices on both chains → `planRebalance` (XCM only if a side is too thin to trade) → `findOpportunities` (plus the ETH watch, and a network-fee estimate every 10 min via `typicalXchainFees`) → `executeArb` on the single best candidate → update the live status.
 
 - `strategy.ts` is **pure**. All quoting goes through the injected `Quoter` interface, so the specs drive it with fake quotes. It holds candidate search, the size ladder, `RESERVE` (per-chain balances never traded), and rebalance planning. Gross profit here already includes pool fees but **not** network fees.
 - `executor.ts` adds the real network fees (`getEstimatedFees` on the actual txs), applies the profit floor, sets slippage limits, dry-runs, and sends. Every action runs inside `measured()`, which reads both chains' balances before and after and writes the delta, valued at the pre-action prices, to the ledger. Realized P&L is always measured, never taken from quotes. Errors whose message starts with `HALT:` inside `measured()` are turned into a `Halt`.
 - `venues.ts`: Asset Hub `AssetConversion` (every pool pairs with DOT, so `ahPath` routes non-DOT pairs through DOT), the Asset Hub PSM (USDT ⇄ dotUSD), the Hydration router via `@galacticcouncil/sdk-next`, and the XCM builders (`transfer_assets_using_type_and_then`: LocalReserve AH→HY, DestinationReserve HY→AH, at most 2 assets per message, DOT first).
 - `chains.ts`: connections, sr25519 key derivation, balances, prices, and `send` (always dry-run first, then sign).
-- `log.ts`: all output. On a TTY, `main.ts` registers `renderLive()` as a live region that redraws in place every second at the bottom of the screen. The bot runs on a Raspberry Pi and is watched over SSH. Normal log lines print above the region; while it is active, `console.log/error/warn` are wrapped so stray SDK output can't tear it. Off a TTY, or with `ARB_PLAIN=1`, every tick prints a plain line. Print through `log.*`, never with raw `process.stdout.write`. The charts in the region (`linePlot`, `barPlot`, sparklines) come from `chart.ts`, which is pure and has specs. `recordSample()` in `main.ts` feeds them one sample per tick. Every printed line passes through `toAscii()` when `ARB_ASCII=1`, so a new symbol needs an entry in `TO_ASCII` in `log.ts`, or it prints as `?`.
+- `dashboard.ts`: what the live status shows (`ui` state, the routes board, the charts, `renderLive()`). `main.ts` updates `ui`, calls `recordSample()` once per tick with every route's gross (from the `observe` callback of `findOpportunities`, plus the ETH watch), and copies its config into `settings`. `preview.ts` drives it with synthetic data. Use it to check layout changes; don't run the bot for that.
+- `log.ts`: all output. On a TTY, `main.ts` registers `renderLive()` as a live region that redraws in place every second at the bottom of the screen. The bot runs on a Raspberry Pi and is watched over SSH. Normal log lines print above the region; while it is active, `console.log/error/warn` are wrapped so stray SDK output can't tear it. Off a TTY, or with `ARB_PLAIN=1`, every tick prints a plain line. Print through `log.*`, never with raw `process.stdout.write`. The charts in the region (`linePlot`, `barPlot`, sparklines) come from `chart.ts`, which is pure and has specs. Every printed line passes through `toAscii()` when `ARB_ASCII=1`, so a new symbol needs an entry in `TO_ASCII` in `log.ts`, or it prints as `?`.
 - `pnl.ts`: `data/state.json` (running totals, baseline, `bootstrapped` flag) and `data/ledger.jsonl` (one line per action). Total P&L = arb + setup + rebalance + market. Delete both files to reset the baseline.
 - `assets.ts`: asset IDs, locations and decimals (DOT 10, USDT/USDC/dotUSD 6, HDX 12). Amounts are `bigint` native units everywhere; convert with `native()` / `human()`.
 
@@ -70,6 +72,8 @@ PSM is only one of the strategies, and on Asset Hub only (dotUSD is not register
 | `ARB_CHART_MINUTES` | `5` | History window of the live charts (`chart.ts`); `0` hides them |
 | `ARB_CHART_HEIGHT` | `8` | Rows for the price plot; shrinks to fit the terminal, `1` = one-line sparklines |
 | `ARB_ASCII` | — | `1` = ASCII only (fonts in PuTTY/mRemoteNG show boxes for block/box/braille glyphs) |
+| `ARB_BOARD_ROWS` | `5` | Routes on the board; `0` hides it |
+| `ARB_WATCH_ETH` | on | `0` = stop quoting the ETH/DOT route |
 
 Hard-coded values that may also need tuning: `MAX_FAILED_IN_A_ROW = 3` (`main.ts`), `RESERVE` and the ladder steps (`strategy.ts`), the 40/40/20 and 50/50 slippage splits and the 10-minute XCM arrival timeout (`executor.ts`).
 
@@ -77,6 +81,8 @@ Hard-coded values that may also need tuning: `MAX_FAILED_IN_A_ROW = 3` (`main.ts
 
 - There is no `.env.example`. The settings tables here and in the README are the reference, so keep them in sync with `config` in `main.ts`.
 - `ARB_MAX_TRADE_USD` is effectively capped by inventory. Each chain holds about equity/6 per asset minus `RESERVE`, and the ladder stops at the first size it can't fund.
+- Read chain state with `BEST` (`{ at: 'best' }`, from `chains.ts`): runtime calls, storage queries and `DryRunApi`. polkadot-api defaults to the finalized block, which was 12 blocks behind best when checked. Quoting from there produced swaps that failed on chain with `AssetConversion.ProvidedMinimumNotSufficientForSwap`.
+- ETH is **watch only** (`watchEth` in `strategy.ts`, `ethQuoter` in `venues.ts`, `ETH` in `assets.ts`). It isn't in `Sym`/`SYMS`, so the book, bootstrap, rebalancing and XCM don't know about it. Trading it would need inventory on both chains and the XCM paths for a Snowbridge asset verified by dry run first.
 - Keep `strategy.ts` free of network calls so the specs stay offline. New quoting needs go on `Quoter`.
 - When selling an entire balance on Asset Hub (e.g. freshly minted dotUSD), `ahSwapIn` needs `keepAlive = false`, or the pallet fails with `Token.NotExpendable`.
 - Chain facts (asset IDs, PSM fees, XCM transfer types) were verified on chain on 2026-11-03. See the README section "Chain facts this relies on" before changing XCM or asset config.

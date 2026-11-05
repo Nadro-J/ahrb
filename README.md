@@ -166,6 +166,8 @@ All settings come from the environment (or `.env`):
 | `ARB_CHART_MINUTES` | `5` | how much history the live charts show; `0` hides them |
 | `ARB_CHART_HEIGHT` | `8` | rows for the price chart (the trade chart gets ~60 %); `1` = one-line sparklines |
 | `ARB_ASCII` | none | `1` prints plain ASCII only, for fonts that show boxes |
+| `ARB_BOARD_ROWS` | `5` | routes shown on the board; `0` hides it |
+| `ARB_WATCH_ETH` | on | `0` stops quoting the ETH/DOT route |
 
 ## Screen output
 
@@ -173,42 +175,58 @@ On a terminal, the bottom of the screen is a live status that redraws in
 place every second instead of printing a line every tick:
 
 ```
-● LIVE #482 up 1h36m · DOT $0.9526 AH / $0.9519 HY (-0.07%) · next check 4s
-  nearest trade -$0.0123 DOT/USDT sell AH→buy HY · best since start -$0.0040 at 14:02
-  equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$0.5) · arbs 0 · last trade none yet
+● LIVE #150 up 15m · DOT $0.9531 AH / $0.9524 HY (-0.07%) · next check 4s
+  nearest trade -$0.0035 DOT/USDT sell AH→buy HY · best since start +$0.0021 at 14:02
+  equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$2) · arbs 2 (1 failed) · last trade 13:40 ok
+  routes gross now · last 15m · best · ETH would have traded 0×
+  -$0.0054  ETH/DOT sell HY→buy AH (watch)  ▁▂▆▇▂▁▁▁▁▁▁▁▁▂▅▇▃  best +$0.0060
+  -$0.0062  psm-redeem                      ▃▄▅▅▄▄▃▂▁▁▁▂▃▄▅▅▄  best -$0.0050
+  -$0.0062  DOT/USDT sell AH→buy HY         ▅▇▆▃▁▂▄▆▇▅▂▁▃▅▇▆▃  best -$0.0010
+  -$0.0078  DOT/USDC sell HY→buy AH         ▃▃▄▄▄▄▃▃▂▁▁▁▁▂▂▃▄  best -$0.0070
+  -$0.0087  USDT/USDC sell AH→buy HY        ▄▅▆▅▄▂▁▁▂▄▅▆▅▄▃▁▁  best -$0.0030
   DOT price   ● Asset Hub   ● Hydration   ◆ both
-   $0.9532 ┤      ●◆◆◆◆●●●●●
-           ┤    ◆◆●    ●●   ●●●                             ●●
-           ┤ ●●◆         ●     ●●●                       ●●●
-   $0.9519 ┤●●●           ●●      ●●                   ●●    ●
-           ┤●               ●●      ●●●             ●●●     ●
-           ┤                  ●●      ●◆◆◆◆◆◆●◆●●●●●      ●●
-           ┤                    ●●●●●●       ● ●●●      ●●
-   $0.9501 ┤                                      ●●●●●●
-           └──────────────────────────────────────────────────
-            -5m                                            now
-  nearest trade gross, before network fees · trades only above $0 + fees
-   +$0.010 ┤                                       ███
-    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄███┄┄┄┄┄┄┄┄
-           ┤█████       ████████████████████████        ██████
-           ┤█               ████████████████               ███
-   -$0.045 ┤                    ████████
-           └──────────────────────────────────────────────────
-            -5m                                            now
+   $0.9532 ┤       ●●◆◆◆◆◆●●●●●●
+           ┤     ◆◆●●     ●●    ●●●●●                                     ●●●
+           ┤ ●●◆◆           ●●●      ●●●                              ●●●●
+   $0.9519 ┤● ●                ●        ●●●●                       ●●●      ●
+           ┤●●                  ●●●         ●●●                ●●●●       ●●
+           ┤                       ●●●       ●●◆◆◆◆◆◆◆◆●◆●●●●●●         ●●
+           ┤                          ●●●●●●●          ● ●●●●        ●●●
+   $0.9501 ┤                                                 ●●●●●●●●
+           └─────────────────────────────────────────────────────────────────
+            -15m                                                          now
+  nearest trade gross, before network fees · trades above +$0.014 (fees + min profit)
+    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+           ┤█████████████████████████████████████████████████████████████████
+           ┤███        ████████████████        ████████████████         █████
+           ┤              ███████████            ██                       ███
+   -$0.007 ┤                  ████                                          █
+           └─────────────────────────────────────────────────────────────────
+            -15m                                                          now
 ```
 
-How to read the charts (newest on the right):
+How to read it (newest on the right):
 
+- **routes**: every route the bot quotes, closest to profitable first. Each
+  row shows the gross now, a sparkline of the window, and the best in the
+  window. Bars are green above $0 and yellow once they clear the "needed"
+  line, where a real route would trade. Rows marked `(watch)` are quoted but
+  never traded (see [ETH (watch only)](#eth-watch-only)).
 - **DOT price**: DOT on Asset Hub and on Hydration on one shared scale. The
   vertical distance between the two lines is the arbitrage gap. ◆ marks where
   both prices are equal.
-- **nearest trade**: the best candidate's gross profit each tick, as bars
-  around the $0 line. Bars hang below $0 while nothing pays. Bars that rise
-  above it turn green but still need to clear network fees and
-  `ARB_MIN_PROFIT_USD` before a trade happens.
+- **nearest trade**: the best tradeable route's gross profit each tick, as
+  bars around the $0 line. The title gives what a trade needs: the network
+  fees of a typical round trip (estimated every 10 minutes from real
+  transactions, nothing sent) plus `ARB_MIN_PROFIT_USD`. When that level is
+  inside the chart it is drawn as a dotted line.
 
-The charts shrink to fit the window. With little room they turn into one-line
-sparklines, and if even that doesn't fit they are hidden. Set
+`npm run preview` draws this screen once from made-up data, without
+connecting to anything. Try `COLUMNS=60 LINES=24 npm run preview` or
+`ARB_ASCII=1 npm run preview` to see other sizes and modes.
+
+The board and charts shrink to fit the window. With little room the charts
+turn into one-line sparklines, and if even that doesn't fit they are hidden. Set
 `ARB_CHART_HEIGHT=1` to always use sparklines, or a higher number for taller
 charts.
 
@@ -244,6 +262,23 @@ tmux attach -t arb
 
 The bot warns at startup if it runs over SSH outside tmux or screen.
 
+## ETH (watch only)
+
+Asset Hub has a DOT/ETH pool (Snowbridge ether, about $4.6k deep on
+2026-11-04) and Hydration lists the same ether as asset 34. Every tick the
+bot quotes the ETH/DOT round trip both ways, as it would trade it, and shows
+it on the board as `(watch)`. **It never trades ETH**: the account holds no
+ETH, and the XCM paths for it have not been verified. When the round trip
+would have cleared fees plus `ARB_MIN_PROFIT_USD`, the bot logs a line
+(`ETH watch … would clear fees`) and counts it in the board header
+("ETH would have traded N×"). After a few days that count is the evidence
+for or against adding ETH as a traded asset.
+
+On 2026-11-04 the closer direction (sell on Hydration, buy back on Asset
+Hub) quoted -$0.0037 at $1, in the same range as the best existing routes.
+The small pool costs 0.34 % at $1 and 0.51 % at $5, so only small sizes make
+sense.
+
 ## Expect it to sit idle
 
 When this was written, Asset Hub DOT/USDT was at $0.9286. Hydration quoted
@@ -260,7 +295,13 @@ does not create trades: the hard floor is still "net > fees".
 - Asset Hub: USDT = Assets 1984, USDC = 1337, dotUSD = 7873 (PSM internal
   asset, external: USDT only, mint fee 0 %, redeem fee 0.01 %, min swap 1).
   Every pool pairs with DOT.
-- Hydration: DOT = 5, USDT = 10, USDC = 22. dotUSD is not registered, so PSM
+- Reads (quotes, balances, PSM state, dry runs) target the **best** block, not
+  the finalized one that polkadot-api uses by default. Finalized was 12 blocks
+  behind best when checked. Quotes from there show spreads that someone has
+  already closed, and the swap then fails on chain with
+  `AssetConversion.ProvidedMinimumNotSufficientForSwap` (the slippage limit),
+  paying its fee.
+- Hydration: DOT = 5, USDT = 10, USDC = 22, ETH = 34 (watch only). dotUSD is not registered, so PSM
   legs stay on Asset Hub.
 - XCM: `PolkadotXcm.transfer_assets_using_type_and_then`. Asset Hub → Hydration
   uses LocalReserve and Hydration → Asset Hub uses DestinationReserve, with at
@@ -278,6 +319,7 @@ does not create trades: the hard floor is still "net > fees".
 | `src/venues.ts` | Asset Hub pools + PSM, Hydration router, XCM builders |
 | `src/chains.ts` | connections, key, balances, prices, dry-run-then-send |
 | `src/pnl.ts` | ledger and P&L split |
-| `src/log.ts`, `src/chart.ts` | output, the live status region, sparklines |
+| `src/log.ts`, `src/chart.ts` | output, the live region mechanics, plots and sparklines |
+| `src/dashboard.ts`, `src/preview.ts` | what the live status shows; `npm run preview` draws it from fake data |
 
 `npm test` runs the specs (no network).

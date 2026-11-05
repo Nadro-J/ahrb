@@ -21,7 +21,7 @@ export const CHAIN_NAME: Record<Chain, string> = { AH: 'Asset Hub', HY: 'Hydrati
 /** An XCM v5 location as polkadot-api encodes it. */
 export type Location = {
   parents: number;
-  interior: { type: 'Here' } | { type: 'X2'; value: unknown[] } | { type: 'X3'; value: unknown[] };
+  interior: { type: 'Here' } | { type: 'X1'; value: unknown } | { type: 'X2'; value: unknown[] } | { type: 'X3'; value: unknown[] };
 };
 
 const ahAsset = (index: number): Location => ({
@@ -64,6 +64,21 @@ export const ASSETS: Record<Sym, AssetInfo> = {
   DOT: { sym: 'DOT', decimals: 10, ahLocation: DOT_LOCATION, hyId: 5, hyLocation: DOT_LOCATION },
   USDT: { sym: 'USDT', decimals: 6, ahIndex: 1984, ahLocation: ahAsset(1984), hyId: 10, hyLocation: ahAssetFromSibling(1984) },
   USDC: { sym: 'USDC', decimals: 6, ahIndex: 1337, ahLocation: ahAsset(1337), hyId: 22, hyLocation: ahAssetFromSibling(1337) },
+};
+
+/**
+ * Bridged ether (Snowbridge), watched but not traded: the bot quotes the
+ * DOT/ETH round trip between the chains to show whether it would pay. On
+ * Asset Hub it is a foreign asset with its own DOT/ETH pool (small, ~$4.6k on
+ * 2026-11-04); on Hydration it is asset 34. Same location on both chains.
+ */
+export const ETH = {
+  decimals: 18,
+  location: {
+    parents: 2,
+    interior: { type: 'X1', value: { type: 'GlobalConsensus', value: { type: 'Ethereum', value: { chain_id: 1n } } } },
+  } as Location,
+  hyId: 34,
 };
 
 /** The PSM's internal stablecoin on Asset Hub. Never leaves Asset Hub. */

@@ -51,6 +51,13 @@ describe('barPlot', () => {
     expect(strip(rows.slice(0, 5))).toEqual(['   2 |  #', '     |  #', '   0 |--#', '     |#', '  -2 |#']);
   });
 
+  it('draws a threshold line inside the range and leaves out one beyond it', () => {
+    const inside = barPlot([-1, 4], 2, 6, (v) => v.toFixed(0), { ...ascii, threshold: { value: 2 } });
+    expect(strip(inside.slice(0, 6))).toEqual(['   4 | #', '     | #', '   2 |.#', '     | #', '   0 |-#', '  -1 |#']);
+    const beyond = barPlot([-1, -3], 2, 4, (v) => v.toFixed(0), { ...ascii, threshold: { value: 9 } });
+    expect(beyond.join('')).not.toContain('.');
+  });
+
   it('labels the zero line even when every value is negative', () => {
     const rows = barPlot([-1, -3], 2, 4, (v) => v.toFixed(0), ascii);
     expect(strip(rows.slice(0, 4))).toEqual(['   0 |--', '     |##', '     | #', '  -3 | #']);

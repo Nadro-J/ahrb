@@ -11,8 +11,8 @@
  *               the forwarded message through the destination's dry_run_xcm).
  */
 import type { sor } from '@galacticcouncil/sdk-next';
-import { ASSET_HUB_PARA, ASSETS, DOT_LOCATION, DOTUSD, HYDRATION_PARA, xcmSortKey, type Chain, type Location, type Sym } from './assets.js';
-import type { Chains, Tx, Wallet } from './chains.js';
+import { ASSET_HUB_PARA, ASSETS, DOT_LOCATION, DOTUSD, ETH, HYDRATION_PARA, xcmSortKey, type Chain, type Location, type Sym } from './assets.js';
+import { BEST, type Chains, type Tx, type Wallet } from './chains.js';
 
 type Trade = sor.Trade;
 
@@ -30,7 +30,7 @@ export function ahPath(from: AhSym, to: AhSym): AhSym[] {
 export async function ahQuoteIn(c: Chains, path: AhSym[], amountIn: bigint): Promise<bigint | null> {
   let amount = amountIn;
   for (let i = 0; i + 1 < path.length; i++) {
-    const q = (await c.ah.apis.AssetConversionApi.quote_price_exact_tokens_for_tokens(ahLoc(path[i]!), ahLoc(path[i + 1]!), amount, true)) as
+    const q = (await c.ah.apis.AssetConversionApi.quote_price_exact_tokens_for_tokens(ahLoc(path[i]!), ahLoc(path[i + 1]!), amount, true, BEST)) as
       | bigint
       | undefined;
     if (!q) return null;
@@ -43,7 +43,7 @@ export async function ahQuoteIn(c: Chains, path: AhSym[], amountIn: bigint): Pro
 export async function ahQuoteOut(c: Chains, path: AhSym[], amountOut: bigint): Promise<bigint | null> {
   let amount = amountOut;
   for (let i = path.length - 1; i > 0; i--) {
-    const q = (await c.ah.apis.AssetConversionApi.quote_price_tokens_for_exact_tokens(ahLoc(path[i - 1]!), ahLoc(path[i]!), amount, true)) as
+    const q = (await c.ah.apis.AssetConversionApi.quote_price_tokens_for_exact_tokens(ahLoc(path[i - 1]!), ahLoc(path[i]!), amount, true, BEST)) as
       | bigint
       | undefined;
     if (!q) return null;
@@ -99,12 +99,12 @@ export interface PsmState {
 export async function psmState(c: Chains): Promise<PsmState | null> {
   const q = c.ah.query.Psm;
   const [info, mintFee, redeemFee, ext, debt, weight] = await Promise.all([
-    q.Psm.getValue(DOTUSD.location),
-    q.MintingFee.getValue(DOTUSD.location, ASSETS.USDT.ahLocation),
-    q.RedemptionFee.getValue(DOTUSD.location, ASSETS.USDT.ahLocation),
-    q.ExternalAssets.getValue(DOTUSD.location, ASSETS.USDT.ahLocation),
-    q.PsmDebt.getValue(DOTUSD.location, ASSETS.USDT.ahLocation),
-    q.AssetCeilingWeight.getValue(DOTUSD.location, ASSETS.USDT.ahLocation),
+    q.Psm.getValue(DOTUSD.location, BEST),
+    q.MintingFee.getValue(DOTUSD.location, ASSETS.USDT.ahLocation, BEST),
+    q.RedemptionFee.getValue(DOTUSD.location, ASSETS.USDT.ahLocation, BEST),
+    q.ExternalAssets.getValue(DOTUSD.location, ASSETS.USDT.ahLocation, BEST),
+    q.PsmDebt.getValue(DOTUSD.location, ASSETS.USDT.ahLocation, BEST),
+    q.AssetCeilingWeight.getValue(DOTUSD.location, ASSETS.USDT.ahLocation, BEST),
   ]);
   if (!info || !ext) return null;
   const status: string = ext.status.type;
@@ -150,18 +150,43 @@ function usable(t: Trade | undefined): Trade | null {
   return t;
 }
 
-export async function hySell(c: Chains, from: Sym, to: Sym, amountIn: bigint): Promise<Trade | null> {
-  return usable(await c.sdk.api.router.getBestSell(ASSETS[from].hyId, ASSETS[to].hyId, amountIn).catch(() => undefined));
+/** A Hydration asset by registry id and decimals. */
+type HyAsset = { id: number; decimals: number };
+const hyAsset = (s: Sym): HyAsset => ({ id: ASSETS[s].hyId, decimals: ASSETS[s].decimals });
+
+async function hySellIds(c: Chains, from: HyAsset, to: HyAsset, amountIn: bigint): Promise<Trade | null> {
+  return usable(await c.sdk.api.router.getBestSell(from.id, to.id, amountIn).catch(() => undefined));
 }
 
-export async function hyBuy(c: Chains, from: Sym, to: Sym, amountOut: bigint): Promise<Trade | null> {
-  const t = usable(await c.sdk.api.router.getBestBuy(ASSETS[from].hyId, ASSETS[to].hyId, amountOut).catch(() => undefined));
+async function hyBuyIds(c: Chains, from: HyAsset, to: HyAsset, amountOut: bigint): Promise<Trade | null> {
+  const t = usable(await c.sdk.api.router.getBestBuy(from.id, to.id, amountOut).catch(() => undefined));
   // An exact-out the pools can't deliver comes back as a near-free dust trade: reject anything under half of spot.
   if (t && t.spotPrice > 0n) {
-    const atSpot = (amountOut * t.spotPrice * 10n ** BigInt(ASSETS[from].decimals)) / 10n ** BigInt(ASSETS[to].decimals + 18);
+    const atSpot = (amountOut * t.spotPrice * 10n ** BigInt(from.decimals)) / 10n ** BigInt(to.decimals + 18);
     if (t.amountIn * 2n < atSpot) return null;
   }
   return t;
+}
+
+export const hySell = (c: Chains, from: Sym, to: Sym, amountIn: bigint) => hySellIds(c, hyAsset(from), hyAsset(to), amountIn);
+export const hyBuy = (c: Chains, from: Sym, to: Sym, amountOut: bigint) => hyBuyIds(c, hyAsset(from), hyAsset(to), amountOut);
+
+/* ------------------------------------------------------- ETH (watch only) */
+
+const HY_DOT: HyAsset = { id: ASSETS.DOT.hyId, decimals: ASSETS.DOT.decimals };
+const HY_ETH: HyAsset = { id: ETH.hyId, decimals: ETH.decimals };
+
+/** Quotes for the DOT/ETH round trip, one function per leg (amounts in ETH wei and DOT planck). */
+export function ethQuoter(c: Chains) {
+  const ah = c.ah.apis.AssetConversionApi;
+  return {
+    /** DOT received for selling `eth` on Asset Hub. */
+    ahSellEth: async (eth: bigint) => ((await ah.quote_price_exact_tokens_for_tokens(ETH.location, DOT_LOCATION, eth, true, BEST)) as bigint | undefined) ?? null,
+    /** DOT needed to buy `eth` on Asset Hub. */
+    ahBuyEth: async (eth: bigint) => ((await ah.quote_price_tokens_for_exact_tokens(DOT_LOCATION, ETH.location, eth, true, BEST)) as bigint | undefined) ?? null,
+    hySellEth: async (eth: bigint) => (await hySellIds(c, HY_ETH, HY_DOT, eth))?.amountOut ?? null,
+    hyBuyEth: async (eth: bigint) => (await hyBuyIds(c, HY_DOT, HY_ETH, eth))?.amountIn ?? null,
+  };
 }
 
 /**

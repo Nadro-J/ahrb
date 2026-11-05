@@ -309,3 +309,17 @@ export async function dotPrices(ctx: Ctx, p: Prices): Promise<{ ah: number; hy: 
   return { ah: p.DOT, hy: spot && spot.amount > 0n ? Number(spot.amount) / 10 ** spot.decimals : null };
 }
 
+
+/**
+ * Network fees of a typical cross-chain round trip: a $1 DOT→USDT swap on
+ * Asset Hub plus a $1 USDT→DOT trade on Hydration, estimated from real
+ * transactions (nothing is sent). For the "needed" line in the status chart.
+ */
+export async function typicalXchainFees(ctx: Ctx, p: Prices): Promise<number | null> {
+  const { c, w } = ctx;
+  const ahTx = ahSwapIn(c, w, ahPath('DOT', 'USDT'), units('DOT', 1, p), 1n);
+  const t = await hySell(c, 'USDT', 'DOT', units('USDT', 1, p));
+  const hyTx = t && (await hyTradeTx(c, w, t, (t.amountOut * 99n) / 100n));
+  if (!hyTx) return null;
+  return (await feeUsd(ctx, 'AH', ahTx, p)) + (await feeUsd(ctx, 'HY', hyTx, p));
+}
