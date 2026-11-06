@@ -39,6 +39,37 @@ export interface LedgerEntry {
   after: Book;
 }
 
+/**
+ * Where an action failed. A dry-run failure sent nothing and cost nothing; an
+ * on-chain failure was included in a block and paid its fee.
+ */
+export type FailStage = 'dry-run' | 'on-chain' | 'other';
+
+export interface ErrorStat {
+  count: number;
+  stage: FailStage;
+  /** USD measured across the failed actions (fees of on-chain failures, partial fills). */
+  costUsd: number;
+  firstAt: string;
+  lastAt: string;
+  /** What was being done the last time, and the full message. */
+  lastWhat: string;
+  lastMessage: string;
+}
+
+/** "Pallet.Error" if the message names one, else the message with numbers taken out. */
+export function errorKey(message: string): string {
+  const named = message.match(/\b([A-Z][A-Za-z]+\.[A-Z][A-Za-z]+)\b/);
+  if (named) return named[1]!;
+  return message.replace(/0x[0-9a-f]+|[\d.]+/gi, '#').replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
+export function failStage(message: string): FailStage {
+  if (/dry run/i.test(message)) return 'dry-run';
+  if (/failed in block/i.test(message)) return 'on-chain';
+  return 'other';
+}
+
 export interface State {
   version: 1;
   account: string;
@@ -48,6 +79,8 @@ export interface State {
   totals: Record<ActionKind, number>;
   arbs: { done: number; profitable: number; failed: number };
   day: { date: string; pnlUsd: number };
+  /** Failures grouped by `${kind} ${stage} ${errorKey}`. */
+  errors: Record<string, ErrorStat>;
 }
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -70,6 +103,7 @@ export class Ledger {
     const file = path.join(dir, 'state.json');
     if (fs.existsSync(file)) {
       const state = JSON.parse(fs.readFileSync(file, 'utf8')) as State;
+      state.errors ??= {}; // added after the first state files were written
       if (state.account !== account) {
         throw new Error(`${file} belongs to ${state.account}, not ${account}. Use another ARB_DATA_DIR or move the file away.`);
       }
@@ -85,6 +119,7 @@ export class Ledger {
       totals: { setup: 0, arb: 0, rebalance: 0 },
       arbs: { done: 0, profitable: 0, failed: 0 },
       day: { date: today(), pnlUsd: 0 },
+      errors: {},
     };
     const ledger = new Ledger(dir, state);
     ledger.save();
@@ -109,7 +144,30 @@ export class Ledger {
         if (e.realizedUsd > 0) s.arbs.profitable += 1;
       } else s.arbs.failed += 1;
     }
+    if (!e.ok && e.error) this.noteError(e);
     this.save();
+  }
+
+  private noteError(e: LedgerEntry): void {
+    const stage = failStage(e.error!);
+    const id = `${e.kind} ${stage} ${errorKey(e.error!)}`;
+    const prev = this.state.errors[id];
+    this.state.errors[id] = {
+      count: (prev?.count ?? 0) + 1,
+      stage,
+      costUsd: (prev?.costUsd ?? 0) + e.realizedUsd,
+      firstAt: prev?.firstAt ?? e.ts,
+      lastAt: e.ts,
+      lastWhat: e.what,
+      lastMessage: e.error!,
+    };
+  }
+
+  /** The most frequent failures first. */
+  topErrors(n = 3): [string, ErrorStat][] {
+    return Object.entries(this.state.errors)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, n);
   }
 
   /** Today's realized P&L (arbs + rebalances), reset at UTC midnight. */

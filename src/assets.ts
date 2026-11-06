@@ -11,10 +11,10 @@
  *               Hydration, so PSM legs stay on Asset Hub.
  */
 
-export type Sym = 'DOT' | 'USDT' | 'USDC';
+export type Sym = 'DOT' | 'USDT' | 'USDC' | 'ETH';
 export type Chain = 'AH' | 'HY';
 
-export const SYMS: readonly Sym[] = ['DOT', 'USDT', 'USDC'];
+export const SYMS: readonly Sym[] = ['DOT', 'USDT', 'USDC', 'ETH'];
 export const CHAINS: readonly Chain[] = ['AH', 'HY'];
 export const CHAIN_NAME: Record<Chain, string> = { AH: 'Asset Hub', HY: 'Hydration' };
 
@@ -47,10 +47,20 @@ const ahAssetFromSibling = (index: number): Location => ({
 });
 export const DOT_LOCATION: Location = { parents: 1, interior: { type: 'Here' } };
 
+/**
+ * Bridged ether (Snowbridge). The same location on both chains. On Asset Hub
+ * it is a ForeignAssets asset (not Assets) with its own DOT/ETH pool, which is
+ * small (~$4.6k on 2026-11-04), so prices move fast and slippage is high.
+ */
+export const ETH_LOCATION: Location = {
+  parents: 2,
+  interior: { type: 'X1', value: { type: 'GlobalConsensus', value: { type: 'Ethereum', value: { chain_id: 1n } } } },
+};
+
 export interface AssetInfo {
   sym: Sym;
   decimals: number;
-  /** Asset Hub `Assets` index (undefined for native DOT). */
+  /** Asset Hub `Assets` index (undefined for native DOT and for ForeignAssets such as ETH). */
   ahIndex?: number;
   /** As Asset Hub sees it. */
   ahLocation: Location;
@@ -64,21 +74,7 @@ export const ASSETS: Record<Sym, AssetInfo> = {
   DOT: { sym: 'DOT', decimals: 10, ahLocation: DOT_LOCATION, hyId: 5, hyLocation: DOT_LOCATION },
   USDT: { sym: 'USDT', decimals: 6, ahIndex: 1984, ahLocation: ahAsset(1984), hyId: 10, hyLocation: ahAssetFromSibling(1984) },
   USDC: { sym: 'USDC', decimals: 6, ahIndex: 1337, ahLocation: ahAsset(1337), hyId: 22, hyLocation: ahAssetFromSibling(1337) },
-};
-
-/**
- * Bridged ether (Snowbridge), watched but not traded: the bot quotes the
- * DOT/ETH round trip between the chains to show whether it would pay. On
- * Asset Hub it is a foreign asset with its own DOT/ETH pool (small, ~$4.6k on
- * 2026-11-04); on Hydration it is asset 34. Same location on both chains.
- */
-export const ETH = {
-  decimals: 18,
-  location: {
-    parents: 2,
-    interior: { type: 'X1', value: { type: 'GlobalConsensus', value: { type: 'Ethereum', value: { chain_id: 1n } } } },
-  } as Location,
-  hyId: 34,
+  ETH: { sym: 'ETH', decimals: 18, ahLocation: ETH_LOCATION, hyId: 34, hyLocation: ETH_LOCATION },
 };
 
 /** The PSM's internal stablecoin on Asset Hub. Never leaves Asset Hub. */
@@ -92,9 +88,10 @@ export const HYDRATION_PARA = 2034;
  * XCM multi-asset lists must be sorted by location (parents, then interior).
  * On Asset Hub the local assets (parents 0) sort before DOT; on Hydration DOT
  * (Here) sorts before the X3 stables. Within each, lower GeneralIndex first.
+ * ETH (parents 2) sorts last on both.
  */
 export function xcmSortKey(chain: Chain, sym: Sym): number {
-  const order: Record<Chain, Sym[]> = { AH: ['USDC', 'USDT', 'DOT'], HY: ['DOT', 'USDC', 'USDT'] };
+  const order: Record<Chain, Sym[]> = { AH: ['USDC', 'USDT', 'DOT', 'ETH'], HY: ['DOT', 'USDC', 'USDT', 'ETH'] };
   return order[chain].indexOf(sym);
 }
 

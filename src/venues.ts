@@ -11,7 +11,7 @@
  *               the forwarded message through the destination's dry_run_xcm).
  */
 import type { sor } from '@galacticcouncil/sdk-next';
-import { ASSET_HUB_PARA, ASSETS, DOT_LOCATION, DOTUSD, ETH, HYDRATION_PARA, xcmSortKey, type Chain, type Location, type Sym } from './assets.js';
+import { ASSET_HUB_PARA, ASSETS, DOT_LOCATION, DOTUSD, HYDRATION_PARA, xcmSortKey, type Chain, type Location, type Sym } from './assets.js';
 import { BEST, type Chains, type Tx, type Wallet } from './chains.js';
 
 type Trade = sor.Trade;
@@ -171,24 +171,6 @@ async function hyBuyIds(c: Chains, from: HyAsset, to: HyAsset, amountOut: bigint
 export const hySell = (c: Chains, from: Sym, to: Sym, amountIn: bigint) => hySellIds(c, hyAsset(from), hyAsset(to), amountIn);
 export const hyBuy = (c: Chains, from: Sym, to: Sym, amountOut: bigint) => hyBuyIds(c, hyAsset(from), hyAsset(to), amountOut);
 
-/* ------------------------------------------------------- ETH (watch only) */
-
-const HY_DOT: HyAsset = { id: ASSETS.DOT.hyId, decimals: ASSETS.DOT.decimals };
-const HY_ETH: HyAsset = { id: ETH.hyId, decimals: ETH.decimals };
-
-/** Quotes for the DOT/ETH round trip, one function per leg (amounts in ETH wei and DOT planck). */
-export function ethQuoter(c: Chains) {
-  const ah = c.ah.apis.AssetConversionApi;
-  return {
-    /** DOT received for selling `eth` on Asset Hub. */
-    ahSellEth: async (eth: bigint) => ((await ah.quote_price_exact_tokens_for_tokens(ETH.location, DOT_LOCATION, eth, true, BEST)) as bigint | undefined) ?? null,
-    /** DOT needed to buy `eth` on Asset Hub. */
-    ahBuyEth: async (eth: bigint) => ((await ah.quote_price_tokens_for_exact_tokens(DOT_LOCATION, ETH.location, eth, true, BEST)) as bigint | undefined) ?? null,
-    hySellEth: async (eth: bigint) => (await hySellIds(c, HY_ETH, HY_DOT, eth))?.amountOut ?? null,
-    hyBuyEth: async (eth: bigint) => (await hyBuyIds(c, HY_DOT, HY_ETH, eth))?.amountIn ?? null,
-  };
-}
-
 /**
  * The router transaction for `trade` with its limit set to `limit` (min out
  * for a sell, max in for a buy). The SDK takes slippage in whole basis
@@ -224,6 +206,24 @@ export interface XcmItem {
 
 /** pallet-xcm refuses more than this many assets in one transfer (TooManyAssets). */
 export const XCM_MAX_ASSETS = 2;
+
+/** Assets that only travel alone: their paths were verified by dry run as single-asset messages only. */
+const TRAVELS_ALONE: Sym[] = ['ETH'];
+
+/**
+ * Items grouped into messages: at most XCM_MAX_ASSETS each, DOT first (it pays
+ * the destination fee for its message), and ETH always on its own. ETH paid
+ * its own destination fee in both directions when dry-run on 2026-11-05
+ * (`npm run verify-xcm -- ETH`); ETH paired with DOT could not be checked
+ * from Hydration.
+ */
+export function xcmMessages(items: XcmItem[]): XcmItem[][] {
+  const alone = items.filter((i) => TRAVELS_ALONE.includes(i.sym));
+  const rest = items.filter((i) => !TRAVELS_ALONE.includes(i.sym)).sort((a, b) => Number(b.sym === 'DOT') - Number(a.sym === 'DOT'));
+  const out: XcmItem[][] = [];
+  for (let i = 0; i < rest.length; i += XCM_MAX_ASSETS) out.push(rest.slice(i, i + XCM_MAX_ASSETS));
+  return [...out, ...alone.map((i) => [i])];
+}
 
 /**
  * One XCM carrying up to two items from `from` to the other chain;

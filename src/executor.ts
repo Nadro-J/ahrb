@@ -23,7 +23,7 @@ import {
   psmMint,
   psmRedeem,
   type PsmState,
-  XCM_MAX_ASSETS,
+  xcmMessages as messages,
   type XcmItem,
   xcmTransfer,
 } from './venues.js';
@@ -47,7 +47,7 @@ async function measured(
   kind: ActionKind,
   what: string,
   fn: (txs: Sent[], prices: Prices) => Promise<{ expectedUsd?: number } | void>
-): Promise<{ ok: boolean; realizedUsd: number }> {
+): Promise<{ ok: boolean; realizedUsd: number; error?: string }> {
   const [before, prices] = await Promise.all([readBook(ctx.c, ctx.w), readPrices(ctx.c)]);
   const txs: Sent[] = [];
   let ok = true;
@@ -66,7 +66,7 @@ async function measured(
   if (ok) log.ok(`${tag} ${what} → realized ${usdColored(realizedUsd)}${expectedUsd !== undefined ? color.dim(` (expected ${usd(expectedUsd)})`) : ''}`);
   else log.error(`${tag} ${what} failed: ${error} → realized ${usdColored(realizedUsd)}`);
   if (error && error.startsWith('HALT:')) throw new Halt(error.slice(5).trim());
-  return { ok, realizedUsd };
+  return { ok, realizedUsd, error };
 }
 
 /** Fee for `tx` in USD: Asset Hub quotes DOT, Hydration quotes HDX (charged in the account's fee currency). */
@@ -103,13 +103,6 @@ async function xcm(ctx: Ctx, kind: ActionKind, from: Chain, items: XcmItem[]): P
   return res.ok;
 }
 
-/** Items grouped into messages of at most XCM_MAX_ASSETS, DOT first (it pays the destination fee for its message). */
-function messages(items: XcmItem[]): XcmItem[][] {
-  const ordered = [...items].sort((a, b) => Number(b.sym === 'DOT') - Number(a.sym === 'DOT'));
-  const out: XcmItem[][] = [];
-  for (let i = 0; i < ordered.length; i += XCM_MAX_ASSETS) out.push(ordered.slice(i, i + XCM_MAX_ASSETS));
-  return out;
-}
 
 export async function rebalance(ctx: Ctx, plans: RebalancePlan[]): Promise<void> {
   for (const plan of plans) for (const msg of messages(plan.items)) await xcm(ctx, 'rebalance', plan.from, msg);
@@ -117,23 +110,40 @@ export async function rebalance(ctx: Ctx, plans: RebalancePlan[]): Promise<void>
 
 /* ============================================================== bootstrap */
 
+/** Per-asset, per-chain inventory target: equity split evenly over every asset on both chains. */
+export const inventoryTarget = (equityUsd: number) => equityUsd / (2 * SYMS.length);
+
 /**
- * Turn the starting balance into even inventory: equity / 6 in each of DOT,
- * USDT and USDC on each chain. Bought on Asset Hub, then half of each sent to
- * Hydration in one XCM. Safe to re-run: each step tops up only what is missing.
+ * Assets the account barely holds (under a quarter of the target across both
+ * chains), e.g. one newly added to SYMS after the first setup. `bootstrap`
+ * with this list sets up just those.
  */
-export async function bootstrap(ctx: Ctx): Promise<void> {
+export function missingAssets(book: Book, p: Prices): Sym[] {
+  const target = inventoryTarget(usdOf(book, p));
+  return SYMS.filter((s) => toUsd(s, book.AH[s] + book.HY[s], p) < target / 2);
+}
+
+/**
+ * Turn the starting balance into even inventory: equity / 8 in each of DOT,
+ * USDT, USDC and ETH on each chain. Bought on Asset Hub with USDT, then half
+ * of each sent to Hydration. Safe to re-run: each step tops up only what is
+ * missing. With `only`, sets up just those assets (and spends only the USDT
+ * the account can spare), so an asset added later doesn't redo the rest.
+ */
+export async function bootstrap(ctx: Ctx, only?: Sym[]): Promise<void> {
   const { c, w } = ctx;
+  const wanted = (s: Sym) => !only || only.includes(s);
   let [book, p] = await Promise.all([readBook(c, w), readPrices(c)]);
   const equity = usdOf(book, p);
-  const target = equity / 6;
-  log.step(`setup: equity $${equity.toFixed(2)} → target ~$${target.toFixed(2)} of each of DOT/USDT/USDC on each chain`);
+  const target = inventoryTarget(equity);
+  const which = only ? only.join('/') : SYMS.join('/');
+  log.step(`setup: equity $${equity.toFixed(2)} → target ~$${target.toFixed(2)} of each of ${which} on each chain`);
 
   // 1. DOT on Asset Hub for both chains (+ the fee reserve). Fees are paid in USDT until the account holds DOT.
   // Holdings on both chains count, so a restart after the XCM step buys nothing twice.
   const wantDot = units('DOT', 2 * target, p) + RESERVE.AH.DOT;
   const haveDot = book.AH.DOT + book.HY.DOT;
-  if (haveDot < (wantDot * 95n) / 100n) {
+  if (wanted('DOT') && haveDot < (wantDot * 95n) / 100n) {
     const buy = wantDot - haveDot;
     const quote = await ahQuoteOut(c, ['USDT', 'DOT'], buy);
     if (!quote) throw new Error('setup: no Asset Hub quote for USDT→DOT');
@@ -146,36 +156,51 @@ export async function bootstrap(ctx: Ctx): Promise<void> {
     book = await readBook(c, w);
   }
 
-  // 2. USDC on Asset Hub for both chains (USDT → DOT → USDC).
-  const wantUsdc = units('USDC', 2 * target, p);
-  const haveUsdc = book.AH.USDC + book.HY.USDC;
-  if (haveUsdc < (wantUsdc * 95n) / 100n) {
-    const spend = wantUsdc - haveUsdc;
-    const out = await ahQuoteIn(c, ahPath('USDT', 'USDC'), spend);
-    if (!out) throw new Error('setup: no Asset Hub quote for USDT→USDC');
+  // 2. The other assets on Asset Hub for both chains, bought with USDT (USDT → DOT → X).
+  for (const sym of SYMS.filter((s) => s !== 'DOT' && s !== 'USDT' && wanted(s))) {
+    const want = units(sym, 2 * target, p) + RESERVE.AH[sym] + RESERVE.HY[sym];
+    const have = book.AH[sym] + book.HY[sym];
+    if (have >= (want * 95n) / 100n) continue;
+    // Spend only USDT the account can spare: its reserve and $1 stay.
+    const spare = book.AH.USDT - RESERVE.AH.USDT - units('USDT', 1, p);
+    const needUsd = toUsd(sym, want - have, p);
+    const spendUsd = Math.min(needUsd, spare > 0n ? toUsd('USDT', spare, p) : 0);
+    if (spendUsd < 1) {
+      log.warn(`setup: not enough spare USDT on Asset Hub to buy ${sym} (needs ~$${needUsd.toFixed(2)}): send USDT to ${w.ah} and restart`);
+      continue;
+    }
+    if (spendUsd < needUsd * 0.95) log.warn(`setup: buying only $${spendUsd.toFixed(2)} of ${sym} (target $${needUsd.toFixed(2)}): add USDT for the rest`);
+    const spend = units('USDT', spendUsd, p);
+    const out = await ahQuoteIn(c, ahPath('USDT', sym), spend);
+    if (!out) throw new Error(`setup: no Asset Hub quote for USDT→${sym}`);
     const minOut = (out * 99n) / 100n;
-    const res = await measured(ctx, 'setup', `swap ${fmt(spend, 6, 2)} USDT → ≥${fmt(minOut, 6, 2)} USDC on AH`, async (txs) => {
-      txs.push(await send(c, w, 'AH', 'swap USDT→USDC', ahSwapIn(c, w, ahPath('USDT', 'USDC'), spend, minOut)));
+    const d = ASSETS[sym].decimals;
+    const res = await measured(ctx, 'setup', `swap ${fmt(spend, 6, 2)} USDT → ≥${fmt(minOut, d, d > 6 ? 6 : 2)} ${sym} on AH`, async (txs) => {
+      txs.push(await send(c, w, 'AH', `swap USDT→${sym}`, ahSwapIn(c, w, ahPath('USDT', sym), spend, minOut)));
     });
-    if (!res.ok) throw new Halt('setup: buying USDC failed (see above) — fix and restart, setup resumes where it stopped');
+    if (!res.ok) throw new Halt(`setup: buying ${sym} failed (see above) — fix and restart, setup resumes where it stopped`);
     book = await readBook(c, w);
   }
 
-  // 3. Hydration's half of each asset, in messages of at most two assets (DOT first).
+  // 3. Hydration's half of each asset. Up to the target when Asset Hub holds more than it, else an even split
+  //    (an asset bought short of its target still ends up on both chains). xcmMessages groups them.
   p = await readPrices(c);
-  const items: XcmItem[] = SYMS.map((sym) => {
-    const keep = units(sym, target, p) + RESERVE.AH[sym];
+  const items: XcmItem[] = SYMS.filter(wanted).map((sym) => {
     const missing = units(sym, target, p) - book.HY[sym];
-    const room = book.AH[sym] > keep ? book.AH[sym] - keep : 0n;
-    return { sym, amount: missing > 0n ? (missing < room ? missing : room) : 0n };
+    const aboveTarget = book.AH[sym] - (units(sym, target, p) + RESERVE.AH[sym]);
+    const halfGap = (book.AH[sym] - RESERVE.AH[sym] - book.HY[sym]) / 2n;
+    const room = aboveTarget > halfGap ? aboveTarget : halfGap;
+    return { sym, amount: missing > 0n && room > 0n ? (missing < room ? missing : room) : 0n };
   }).filter((i) => toUsd(i.sym, i.amount, p) >= 0.5);
   for (const msg of messages(items)) {
     if (!(await xcm(ctx, 'setup', 'AH', msg))) throw new Halt('setup: XCM to Hydration failed (see above) — fix and restart');
   }
 
   await ensureHydrationFeeCurrency(ctx);
-  ctx.ledger.state.bootstrapped = true;
-  ctx.ledger.save();
+  if (!only) {
+    ctx.ledger.state.bootstrapped = true;
+    ctx.ledger.save();
+  }
   log.ok('setup complete');
 }
 
@@ -201,7 +226,7 @@ export async function ensureHydrationFeeCurrency(ctx: Ctx): Promise<void> {
 
 /* ==================================================================== arbs */
 
-export type ArbOutcome = { outcome: 'ok' | 'failed' } | { outcome: 'skipped'; reason: string };
+export type ArbOutcome = { outcome: 'ok' } | { outcome: 'failed'; error: string; realizedUsd: number } | { outcome: 'skipped'; reason: string };
 
 /**
  * Execute an opportunity if it still clears every cost. 'skipped' means
@@ -215,7 +240,7 @@ export async function executeArb(ctx: Ctx, o: Opportunity, p: Prices, psm: PsmSt
     await plan.run(txs);
     return { expectedUsd: plan.netUsd };
   });
-  return { outcome: res.ok ? 'ok' : 'failed' };
+  return res.ok ? { outcome: 'ok' } : { outcome: 'failed', error: res.error ?? 'unknown error', realizedUsd: res.realizedUsd };
 }
 
 interface Plan {

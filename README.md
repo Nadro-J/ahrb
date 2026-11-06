@@ -53,18 +53,18 @@ Result: 1.92 − 1.89 = **0.03 USDT** profit before network fees.
 
 ```mermaid
 flowchart TD
-    A(["tick: every ARB_POLL_SECONDS"]) --> K{"STOP file, daily loss limit<br/>or 3 failed arbs in a row?"}
+    A(["tick: every ARB_POLL_SECONDS"]) --> K{"STOP file, daily loss limit<br/>or an XCM stuck 10 min?"}
     K -- yes --> H(["halt (exit 2)"])
     K -- no --> B["read balances and prices on both chains"]
     B --> R{"a side too thin to trade?<br/>(under 1.5 × ARB_MIN_TRADE_USD)"}
     R -- yes --> X["XCM: move it back to a 50/50 split"] --> Q
-    R -- no --> Q["quote every candidate:<br/>12 cross-chain + PSM mint/redeem<br/>at sizes $1, $1.5, $2 … up to ARB_MAX_TRADE_USD"]
+    R -- no --> Q["quote every candidate:<br/>24 cross-chain + PSM mint/redeem<br/>(routes paused after a failure are skipped)<br/>at sizes $1, $1.5, $2 … up to ARB_MAX_TRADE_USD"]
     Q --> G{"best gross profit > 0?<br/>(pool fees already included)"}
     G -- no --> W["wait (the status line shows the nearest trade)"]
     G -- yes --> F{"gross − network fees<br/>≥ ARB_MIN_PROFIT_USD?"}
     F -- no --> W
     F -- yes --> D["dry-run both legs, then send them together<br/>with slippage limits"]
-    D --> M["measure balances before vs after → ledger"]
+    D --> M["measure balances before vs after → ledger<br/>(a failure is counted by error and its route paused)"]
     M --> W
     W --> A
 ```
@@ -87,18 +87,20 @@ time (see [Expect it to sit idle](#expect-it-to-sit-idle)).
 ## What it does
 
 **1. Setup (first run only).** It turns the deposit into even inventory: about
-1/6 of the equity in each of DOT, USDT and USDC on each chain. It buys DOT and
-USDC on Asset Hub (the first swap pays its fee in USDT, because the account
-holds no DOT yet), sends half of each asset to Hydration over XCM, and sets
-Hydration's fee currency to DOT. Setup tops up only what is missing, so it is
-safe to restart midway.
+1/8 of the equity in each of DOT, USDT, USDC and ETH on each chain. It buys
+DOT, USDC and ETH with USDT on Asset Hub (the first swap pays its fee in USDT,
+because the account holds no DOT yet), sends half of each asset to Hydration
+over XCM, and sets Hydration's fee currency to DOT. Setup tops up only what is
+missing, so it is safe to restart midway. An asset added later (ETH, for an
+account set up before it was added) is set up on its own at the next start,
+using only the USDT the account can spare.
 
 **2. Every tick (12 s).** It reads balances and prices on both chains and
 quotes every candidate:
 
 | Loop | What happens | Atomic? |
 |---|---|---|
-| **xchain** | Sell X for Y on the chain where X is dear and buy the same X back with Y where it is cheap, at the same time, from inventory on both chains. All six ordered pairs of DOT/USDT/USDC in both chain directions. The profit is the Y left over. | No. Both legs are dry-run first, then submitted together. Each leg's slippage limit is set so the pair still breaks even if both fill at their worst price. |
+| **xchain** | Sell X for Y on the chain where X is dear and buy the same X back with Y where it is cheap, at the same time, from inventory on both chains. All twelve ordered pairs of DOT/USDT/USDC/ETH in both chain directions. The profit is the Y left over. | No. Both legs are dry-run first, then submitted together. Each leg's slippage limit is set so the pair still breaks even if both fill at their worst price. |
 | **psm-mint** | USDT → PSM mint → dotUSD → sell on the pool for USDT (when dotUSD trades above $1) | Yes, one `utility.batch_all` |
 | **psm-redeem** | USDT → buy dotUSD on the pool → PSM redeem → USDT (when dotUSD trades below $1) | Yes, one `utility.batch_all` |
 
@@ -142,8 +144,26 @@ balances before and after. Delete both files to start a fresh baseline.
 - **Kill switch**: `touch data/STOP` (the bot halts at the next tick and
   refuses to start while the file exists), or `ARB_KILL=1`.
 - **Automatic halts**: the daily loss limit (`ARB_MAX_DAILY_LOSS_USD`, counting
-  arbs and rebalances in the current UTC day), 3 failed arbs in a row, or an XCM
-  that has not arrived after 10 minutes.
+  arbs and rebalances in the current UTC day) or an XCM that has not arrived
+  after 10 minutes. Failed trades do **not** stop the bot (see
+  [Errors](#errors)).
+
+## Errors
+
+A failed trade is logged, counted and kept running past:
+
+- The ledger counts every failure by kind, stage and error name (e.g.
+  `AssetConversion.ProvidedMinimumNotSufficientForSwap`), with its measured
+  cost. The live status shows the two most frequent.
+- **dry-run** failures sent nothing and cost nothing. **on-chain** failures
+  were included in a block and paid their fees.
+- The route that failed is paused: 1 minute after the first failure, doubling
+  with each failure in a row up to 30 minutes, cleared by a success. A broken
+  route can't burn fees every tick, and the other routes keep trading. The
+  daily loss limit is the backstop.
+- `npm run errors` lists every failure group (count, cost, first and last time,
+  the last message in full) and the most recent failures, from the ledger
+  alone. `npm run errors -- 30` shows the last 30.
 
 ## Settings
 
@@ -167,7 +187,6 @@ All settings come from the environment (or `.env`):
 | `ARB_CHART_HEIGHT` | `8` | rows for the price chart (the trade chart gets ~60 %); `1` = one-line sparklines |
 | `ARB_ASCII` | none | `1` prints plain ASCII only, for fonts that show boxes |
 | `ARB_BOARD_ROWS` | `5` | routes shown on the board; `0` hides it |
-| `ARB_WATCH_ETH` | on | `0` stops quoting the ETH/DOT route |
 
 ## Screen output
 
@@ -178,31 +197,32 @@ place every second instead of printing a line every tick:
 ● LIVE #150 up 15m · DOT $0.9531 AH / $0.9524 HY (-0.07%) · next check 4s
   nearest trade -$0.0035 DOT/USDT sell AH→buy HY · best since start +$0.0021 at 14:02
   equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$2) · arbs 2 (1 failed) · last trade 13:40 ok
-  routes gross now · last 15m · best · ETH would have traded 0×
-  -$0.0054  ETH/DOT sell HY→buy AH (watch)  ▁▂▆▇▂▁▁▁▁▁▁▁▁▂▅▇▃  best +$0.0060
-  -$0.0062  psm-redeem                      ▃▄▅▅▄▄▃▂▁▁▁▂▃▄▅▅▄  best -$0.0050
-  -$0.0062  DOT/USDT sell AH→buy HY         ▅▇▆▃▁▂▄▆▇▅▂▁▃▅▇▆▃  best -$0.0010
-  -$0.0078  DOT/USDC sell HY→buy AH         ▃▃▄▄▄▄▃▃▂▁▁▁▁▂▂▃▄  best -$0.0070
-  -$0.0087  USDT/USDC sell AH→buy HY        ▄▅▆▅▄▂▁▁▂▄▅▆▅▄▃▁▁  best -$0.0030
+  errors 3× AssetConversion.ProvidedMinimumNotSufficientForSwap (on-chain -$0.011) · 1× Token.FundsUnavailable (dry-run) · npm run errors
+  routes gross now · last 15m · best
+  -$0.0054  ETH/DOT sell HY→buy AH    ▁▁▁▃▅▇█▆▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▄▆█▇▄▂  best +$0.0060
+  -$0.0062  psm-redeem                ▃▄▄▄▅▅▅▅▄▄▄▃▃▂▂▁▁▁▁▁▁▂▂▃▃▄▄▅▅▅▅▅▄  best -$0.0050
+  -$0.0062  DOT/USDT sell AH→buy HY   ▄▆▇▇▆▅▄▃▁▁▁▂▄▅▆▇▇▆▅▃▂▁▁▂▃▅▆▇▇▆▅▄▂  best -$0.0010  paused 3m
+  -$0.0078  DOT/USDC sell HY→buy AH   ▃▃▃▄▄▄▄▄▄▄▄▄▃▃▃▂▂▂▁▁▁▁▁▁▁▁▂▂▂▃▃▃▄  best -$0.0070
+  -$0.0087  USDT/USDC sell AH→buy HY  ▄▄▅▅▆▆▅▅▄▃▂▂▁▁▁▁▂▃▄▄▅▅▆▆▅▅▄▃▂▂▁▁▁  best -$0.0030
   DOT price   ● Asset Hub   ● Hydration   ◆ both
-   $0.9532 ┤       ●●◆◆◆◆◆●●●●●●
-           ┤     ◆◆●●     ●●    ●●●●●                                     ●●●
-           ┤ ●●◆◆           ●●●      ●●●                              ●●●●
-   $0.9519 ┤● ●                ●        ●●●●                       ●●●      ●
-           ┤●●                  ●●●         ●●●                ●●●●       ●●
-           ┤                       ●●●       ●●◆◆◆◆◆◆◆◆●◆●●●●●●         ●●
-           ┤                          ●●●●●●●          ● ●●●●        ●●●
-   $0.9501 ┤                                                 ●●●●●●●●
-           └─────────────────────────────────────────────────────────────────
-            -15m                                                          now
+   $0.9532 ┤        ●●◆◆◆◆◆◆●●●●●●●
+           ┤     ◆◆◆●●      ●●●    ●●●●●                                           ●●●●
+           ┤ ●●◆◆              ●●       ●●●●                                   ●●●●
+   $0.9519 ┤● ●                  ●●         ●●●●                           ●●●●      ●●
+           ┤●●                     ●●●          ●●●●                   ●●●●        ●●
+           ┤                          ●●●●        ●●◆◆◆◆◆◆◆◆◆●◆◆●●●●●●●          ●●
+           ┤                              ●●●●●●●●           ●  ●●●●●         ●●●
+   $0.9501 ┤                                                         ●●●●●●●●●
+           └───────────────────────────────────────────────────────────────────────────
+            -15m                                                                    now
   nearest trade gross, before network fees · trades above +$0.014 (fees + min profit)
-    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-           ┤█████████████████████████████████████████████████████████████████
-           ┤███        ████████████████        ████████████████         █████
-           ┤              ███████████            ██                       ███
-   -$0.007 ┤                  ████                                          █
-           └─────────────────────────────────────────────────────────────────
-            -15m                                                          now
+    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+           ┤███████████████████████████████████████████████████████████████████████████
+           ┤███         ███████████████████         ███████████████████          ██████
+           ┤                ████████████               ██                          ████
+   -$0.007 ┤                    ██████                                                █
+           └───────────────────────────────────────────────────────────────────────────
+            -15m                                                                    now
 ```
 
 How to read it (newest on the right):
@@ -210,8 +230,10 @@ How to read it (newest on the right):
 - **routes**: every route the bot quotes, closest to profitable first. Each
   row shows the gross now, a sparkline of the window, and the best in the
   window. Bars are green above $0 and yellow once they clear the "needed"
-  line, where a real route would trade. Rows marked `(watch)` are quoted but
-  never traded (see [ETH (watch only)](#eth-watch-only)).
+  line, where a trade goes ahead. A route paused after a failure says
+  `paused Nm`.
+- **errors**: the two most frequent failures, with their stage and cost
+  (shown only once something has failed).
 - **DOT price**: DOT on Asset Hub and on Hydration on one shared scale. The
   vertical distance between the two lines is the arbitrage gap. ◆ marks where
   both prices are equal.
@@ -262,22 +284,36 @@ tmux attach -t arb
 
 The bot warns at startup if it runs over SSH outside tmux or screen.
 
-## ETH (watch only)
+## ETH
 
-Asset Hub has a DOT/ETH pool (Snowbridge ether, about $4.6k deep on
-2026-11-04) and Hydration lists the same ether as asset 34. Every tick the
-bot quotes the ETH/DOT round trip both ways, as it would trade it, and shows
-it on the board as `(watch)`. **It never trades ETH**: the account holds no
-ETH, and the XCM paths for it have not been verified. When the round trip
-would have cleared fees plus `ARB_MIN_PROFIT_USD`, the bot logs a line
-(`ETH watch … would clear fees`) and counts it in the board header
-("ETH would have traded N×"). After a few days that count is the evidence
-for or against adding ETH as a traded asset.
+ETH (Snowbridge ether) trades like the other assets. On Asset Hub it is a
+ForeignAssets asset with its own DOT/ETH pool, which is small (about $4.6k on
+2026-11-04): 0.34 % to swap $1, 0.51 % for $5. So prices there move fast, and
+only small sizes pay. On Hydration it is asset 34, routed through the Aave
+money market.
 
-On 2026-11-04 the closer direction (sell on Hydration, buy back on Asset
-Hub) quoted -$0.0037 at $1, in the same range as the best existing routes.
-The small pool costs 0.34 % at $1 and 0.51 % at $5, so only small sizes make
-sense.
+- Setup buys it with USDT (USDT → DOT → ETH on Asset Hub) and sends half to
+  Hydration. An account set up before ETH was added gets it at the next start,
+  using only spare USDT on Asset Hub. To fully stock it, add USDT first and
+  record the deposit (see [Adding funds](#adding-funds)).
+- **ETH always travels in its own XCM message.** Its paths were verified
+  (`npm run verify-xcm -- ETH`, 2026-11-05) in both directions as a
+  single-asset message, paying its own destination fee in ETH. ETH paired with
+  DOT could not be checked from Hydration.
+- Reserve kept back: 0.00003 ETH on Asset Hub, 0.000011 on Hydration (twice
+  each chain's existential deposit).
+
+## Adding funds
+
+Send USDT to the account on Asset Hub, then, with the bot stopped:
+
+```sh
+npm run deposit -- 10     # the USD you added (negative for a withdrawal)
+npm start
+```
+
+`deposit` raises the P&L baseline, so the new money isn't counted as profit.
+At start the bot sets up any asset it holds too little of.
 
 ## Expect it to sit idle
 
@@ -301,12 +337,14 @@ does not create trades: the hard floor is still "net > fees".
   already closed, and the swap then fails on chain with
   `AssetConversion.ProvidedMinimumNotSufficientForSwap` (the slippage limit),
   paying its fee.
-- Hydration: DOT = 5, USDT = 10, USDC = 22, ETH = 34 (watch only). dotUSD is not registered, so PSM
+- Asset Hub ETH: ForeignAssets, location `{ parents: 2, GlobalConsensus(Ethereum { chain_id: 1 }) }`, min balance 0.000015.
+- Hydration: DOT = 5, USDT = 10, USDC = 22, ETH = 34 (existential deposit 0.0000054). dotUSD is not registered, so PSM
   legs stay on Asset Hub.
 - XCM: `PolkadotXcm.transfer_assets_using_type_and_then`. Asset Hub → Hydration
   uses LocalReserve and Hydration → Asset Hub uses DestinationReserve, with at
-  most 2 assets per message. Both directions were dry-run end to end for every
-  asset (source `dry_run_call`, then destination `dry_run_xcm`). Plain
+  most 2 assets per message, and ETH on its own. Both directions were dry-run
+  end to end for every asset (source `dry_run_call`, then destination
+  `dry_run_xcm`); `npm run verify-xcm -- <ASSET>` repeats that check. Plain
   `transfer_assets` refuses DOT (`InvalidAssetUnknownReserve`).
 
 ## Code
@@ -321,5 +359,8 @@ does not create trades: the hard floor is still "net > fees".
 | `src/pnl.ts` | ledger and P&L split |
 | `src/log.ts`, `src/chart.ts` | output, the live region mechanics, plots and sparklines |
 | `src/dashboard.ts`, `src/preview.ts` | what the live status shows; `npm run preview` draws it from fake data |
+| `src/errors.ts` | `npm run errors`: failures from the ledger |
+| `src/deposit.ts` | `npm run deposit -- <usd>`: record funds added or taken out |
+| `src/verify-xcm.ts` | `npm run verify-xcm -- <ASSET>`: read-only dry runs of every XCM path |
 
 `npm test` runs the specs (no network).

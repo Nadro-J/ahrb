@@ -104,44 +104,50 @@ export async function readBook(c: Chains, w: Wallet): Promise<Book> {
     c.ah.query.Assets.Account.getValue(index, w.ah, BEST).then((a: { balance: bigint } | undefined) => a?.balance ?? 0n);
   const hyToken = (id: number) =>
     c.hy.query.Tokens.Accounts.getValue(w.hy, id, BEST).then((a: { free: bigint; frozen: bigint }) => a.free - a.frozen);
-  const [ahSys, ahUsdt, ahUsdc, ahDotUsd, hySys, hyDot, hyUsdt, hyUsdc] = await Promise.all([
+  const [ahSys, ahUsdt, ahUsdc, ahDotUsd, ahEth, hySys, hyDot, hyUsdt, hyUsdc, hyEth] = await Promise.all([
     c.ah.query.System.Account.getValue(w.ah, BEST),
     ahAsset(ASSETS.USDT.ahIndex!),
     ahAsset(ASSETS.USDC.ahIndex!),
     ahAsset(DOTUSD.index),
+    c.ah.query.ForeignAssets.Account.getValue(ASSETS.ETH.ahLocation, w.ah, BEST).then((a: { balance: bigint } | undefined) => a?.balance ?? 0n),
     c.hy.query.System.Account.getValue(w.hy, BEST),
     hyToken(ASSETS.DOT.hyId),
     hyToken(ASSETS.USDT.hyId),
     hyToken(ASSETS.USDC.hyId),
+    hyToken(ASSETS.ETH.hyId),
   ]);
   const free = (s: { data: { free: bigint; frozen: bigint } }) => (s.data.free > s.data.frozen ? s.data.free - s.data.frozen : 0n);
   return {
-    AH: { DOT: free(ahSys), USDT: ahUsdt, USDC: ahUsdc, dotUSD: ahDotUsd, HDX: 0n },
-    HY: { DOT: hyDot, USDT: hyUsdt, USDC: hyUsdc, dotUSD: 0n, HDX: free(hySys) },
+    AH: { DOT: free(ahSys), USDT: ahUsdt, USDC: ahUsdc, ETH: ahEth, dotUSD: ahDotUsd, HDX: 0n },
+    HY: { DOT: hyDot, USDT: hyUsdt, USDC: hyUsdc, ETH: hyEth, dotUSD: 0n, HDX: free(hySys) },
   };
 }
 
-/** USD prices used to value the book: DOT from the AH DOT/USDT pool, stables at $1, HDX from Hydration's router. */
+/** USD prices used to value the book: DOT from the AH DOT/USDT pool, ETH from the AH DOT/ETH pool, stables at $1, HDX from Hydration's router. */
 export interface Prices {
   DOT: number;
   USDT: number;
   USDC: number;
+  ETH: number;
   dotUSD: number;
   HDX: number;
 }
 
 export async function readPrices(c: Chains): Promise<Prices> {
-  const [reserves, hdx] = await Promise.all([
+  const [reserves, ethReserves, hdx] = await Promise.all([
     c.ah.apis.AssetConversionApi.get_reserves(ASSETS.DOT.ahLocation, ASSETS.USDT.ahLocation, BEST) as Promise<[bigint, bigint] | undefined>,
+    c.ah.apis.AssetConversionApi.get_reserves(ASSETS.DOT.ahLocation, ASSETS.ETH.ahLocation, BEST) as Promise<[bigint, bigint] | undefined>,
     c.sdk.api.router.getSpotPrice(HDX.id, ASSETS.USDT.hyId).catch(() => undefined),
   ]);
   if (!reserves) throw new Error('Asset Hub DOT/USDT pool has no reserves');
   const dot = Number(reserves[1]) / 1e6 / (Number(reserves[0]) / 1e10);
   const hdxUsd = hdx && hdx.amount > 0n ? Number(hdx.amount) / 10 ** hdx.decimals : 0;
-  return { DOT: dot, USDT: 1, USDC: 1, dotUSD: 1, HDX: hdxUsd };
+  if (!ethReserves || ethReserves[1] === 0n) throw new Error('Asset Hub DOT/ETH pool has no reserves');
+  const eth = ((Number(ethReserves[0]) / 1e10) * dot) / (Number(ethReserves[1]) / 1e18);
+  return { DOT: dot, USDT: 1, USDC: 1, ETH: eth, dotUSD: 1, HDX: hdxUsd };
 }
 
-const DECIMALS: Record<keyof Prices, number> = { DOT: 10, USDT: 6, USDC: 6, dotUSD: DOTUSD.decimals, HDX: HDX.decimals };
+const DECIMALS: Record<keyof Prices, number> = { DOT: 10, USDT: 6, USDC: 6, ETH: 18, dotUSD: DOTUSD.decimals, HDX: HDX.decimals };
 
 export function usdOf(book: Book, p: Prices, chain?: Chain): number {
   let total = 0;

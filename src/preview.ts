@@ -3,7 +3,7 @@
  * network: `npm run preview`. For checking the layout at different terminal
  * sizes (`COLUMNS=60 LINES=30 npm run preview`) or with ARB_ASCII=1.
  */
-import { noteEthWatch, recordSample, renderLive, settings, ui } from './dashboard.js';
+import { recordSample, renderLive, settings, ui } from './dashboard.js';
 import { log } from './log.js';
 
 const minutes = Number(process.env.ARB_CHART_MINUTES || 15);
@@ -22,11 +22,10 @@ for (let i = 0; i < n; i++) {
   const cands: Record<string, number> = {};
   routes.forEach((r, k) => (cands[r] = -0.004 - 0.002 * k + 0.003 * Math.sin(i / (9 + 4 * k))));
   const eth = -0.006 + 0.012 * Math.max(0, Math.sin(i / 17)) ** 6;
-  cands['ETH/DOT sell HY→buy AH (watch)'] = eth;
-  cands['ETH/DOT sell AH→buy HY (watch)'] = -0.009;
+  cands['ETH/DOT sell HY→buy AH'] = eth;
+  cands['ETH/DOT sell AH→buy HY'] = -0.009;
   const near = Math.max(...routes.map((r) => cands[r]!));
   recordSample(ah, hy, near, cands, start + i * tick * 1000);
-  noteEthWatch({ label: 'ETH/DOT sell HY→buy AH', grossUsd: eth, sizeUsd: 2 });
 }
 Object.assign(ui, {
   tick: n,
@@ -40,5 +39,10 @@ Object.assign(ui, {
   pnl: -0.07,
   arbs: { done: 2, failed: 1 },
   lastTrade: '13:40 ok',
+  paused: { 'DOT/USDT sell AH→buy HY': 3 * 60_000 },
+  errors: [
+    { what: 'AssetConversion.ProvidedMinimumNotSufficientForSwap', stage: 'on-chain', count: 3, costUsd: -0.011 },
+    { what: 'Token.FundsUnavailable', stage: 'dry-run', count: 1, costUsd: 0 },
+  ],
 });
 for (const line of renderLive()) log.raw(line);

@@ -10,7 +10,10 @@
     "start": "node --no-opt --env-file-if-exists=.env --import tsx src/main.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "preview": "tsx src/preview.ts"
+    "preview": "tsx src/preview.ts",
+    "errors": "tsx src/errors.ts",
+    "verify-xcm": "node --no-opt --import tsx src/verify-xcm.ts",
+    "deposit": "tsx src/deposit.ts"
   },
   "dependencies": {
     "@galacticcouncil/descriptors": "2.8.0",

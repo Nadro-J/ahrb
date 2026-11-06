@@ -8,7 +8,7 @@
  *               `size` of BASE back with QUOTE on the other — at the same
  *               time, from inventory already on both chains. BASE holdings
  *               end where they started; the profit is the QUOTE left over.
- *               Every ordered pair of DOT/USDT/USDC in both chain
+ *               Every ordered pair of DOT/USDT/USDC/ETH in both chain
  *               directions is checked.
  *
  *   psm-mint    (dotUSD rich vs USDT) USDT --PSM mint--> dotUSD --pool--> USDT
@@ -57,10 +57,13 @@ export interface Limits {
   maxTradeUsd: number;
 }
 
-/** Balance kept back from trading on each chain: fees, existential deposits, XCM delivery. */
+/**
+ * Balance kept back from trading on each chain: fees, existential deposits,
+ * XCM delivery. ETH: twice its existential deposit (AH 0.000015, HY 0.0000054).
+ */
 export const RESERVE: Record<Chain, Record<Sym, bigint>> = {
-  AH: { DOT: native(0.15, 10), USDT: native(0.02, 6), USDC: native(0.02, 6) },
-  HY: { DOT: native(0.05, 10), USDT: native(0.02, 6), USDC: native(0.02, 6) },
+  AH: { DOT: native(0.15, 10), USDT: native(0.02, 6), USDC: native(0.02, 6), ETH: native(0.00003, 18) },
+  HY: { DOT: native(0.05, 10), USDT: native(0.02, 6), USDC: native(0.02, 6), ETH: native(0.000011, 18) },
 };
 
 export function tradeable(book: Book, chain: Chain, sym: Sym): bigint {
@@ -225,52 +228,44 @@ export function planRebalance(book: Book, p: Prices, l: Limits): RebalancePlan[]
   return [plans.AH, plans.HY].filter((pl) => pl.items.length > 0);
 }
 
-/* ------------------------------------------------------- ETH (watch only) */
-
-/** Quotes for the DOT/ETH round trip. Amounts: ETH in wei (18 dp), DOT in planck (10 dp). */
-export interface EthQuoter {
-  ahSellEth(eth: bigint): Promise<bigint | null>;
-  ahBuyEth(eth: bigint): Promise<bigint | null>;
-  hySellEth(eth: bigint): Promise<bigint | null>;
-  hyBuyEth(eth: bigint): Promise<bigint | null>;
-}
-
-export interface Watched {
-  label: string;
-  /** Gross profit in USD (pool fees included, network fees not). */
-  grossUsd: number;
-  sizeUsd: number;
-}
+/* ------------------------------------------------------------- cooldowns */
 
 /**
- * The ETH/DOT cross-chain round trip in both directions, as the bot would
- * trade it: sell ETH for DOT on one chain, buy the same ETH back with DOT on
- * the other. Watch only: no inventory check, nothing is executed. Each
- * direction keeps its best size from the ladder; a losing one stays at the
- * smallest size, so the status can show how far off it is.
+ * Routes that failed are paused instead of stopping the bot: 1 min after the
+ * first failure, doubling with each failure in a row, up to 30 min. A success
+ * clears the route; so does a quiet spell of 30 min after its pause ends.
  */
-export async function watchEth(q: EthQuoter, p: Prices, l: Limits): Promise<Watched[]> {
-  const probe = 10n ** 15n; // 0.001 ETH
-  const probeDot = await q.ahSellEth(probe).catch(() => null);
-  if (!probeDot) return [];
-  const ethUsd = (Number(probeDot) / 1e10) * p.DOT * 1000;
-  const out: Watched[] = [];
-  const legs = [
-    { label: 'ETH/DOT sell HY→buy AH', sell: q.hySellEth, buy: q.ahBuyEth },
-    { label: 'ETH/DOT sell AH→buy HY', sell: q.ahSellEth, buy: q.hyBuyEth },
-  ];
-  for (const leg of legs) {
-    let top: Watched | null = null;
-    for (const usd of sizeLadder(l)) {
-      const eth = BigInt(Math.round((usd / ethUsd) * 1e18));
-      const [got, paid] = await Promise.all([leg.sell(eth).catch(() => null), leg.buy(eth).catch(() => null)]);
-      if (!got || !paid) break;
-      const w = { label: leg.label, grossUsd: (Number(got - paid) / 1e10) * p.DOT, sizeUsd: usd };
-      if (top && w.grossUsd <= top.grossUsd) break;
-      top = w;
-      if (w.grossUsd <= 0) break;
-    }
-    if (top) out.push(top);
+export class Cooldowns {
+  private routes = new Map<string, { strikes: number; until: number }>();
+
+  constructor(
+    private readonly baseMs = 60_000,
+    private readonly maxMs = 30 * 60_000
+  ) {}
+
+  /** Record a failure; returns how long the route is now paused and how many failures in a row. */
+  fail(route: string, now = Date.now()): { ms: number; strikes: number } {
+    const prev = this.routes.get(route);
+    const strikes = prev && now < prev.until + this.maxMs ? prev.strikes + 1 : 1;
+    const ms = Math.min(this.maxMs, this.baseMs * 2 ** (strikes - 1));
+    this.routes.set(route, { strikes, until: now + ms });
+    return { ms, strikes };
   }
-  return out.sort((a, b) => b.grossUsd - a.grossUsd);
+
+  ok(route: string): void {
+    this.routes.delete(route);
+  }
+
+  /** Milliseconds left on the route's pause (0 = free to trade). */
+  pausedFor(route: string, now = Date.now()): number {
+    const r = this.routes.get(route);
+    return r && r.until > now ? r.until - now : 0;
+  }
+
+  /** Every paused route with its time left. */
+  paused(now = Date.now()): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [route, r] of this.routes) if (r.until > now) out[route] = r.until - now;
+    return out;
+  }
 }

@@ -5,15 +5,13 @@
  * the layout can be previewed with fake data.
  */
 import { barPlot, extent, linePlot, sparklineIn } from './chart.js';
-import { ascii, c, log, toAscii, usd, usdColored } from './log.js';
-import type { Watched } from './strategy.js';
+import { ascii, c, toAscii, usd, usdColored } from './log.js';
 
 /** The settings the dashboard reads; `main.ts` fills them from the config. */
 export const settings = {
   chartMinutes: 5,
   chartHeight: 8,
   boardRows: 5,
-  watchEth: true,
   minProfitUsd: 0.01,
   maxDailyLossUsd: 2,
 };
@@ -40,8 +38,10 @@ export const ui = {
   /** Network fees of a typical cross-chain round trip, refreshed every 10 min. */
   fees: null as number | null,
   feesAt: 0,
-  /** ETH watch: how often (and for how much) a round trip would have cleared fees + min profit. */
-  eth: { hits: 0, sumUsd: 0, above: false },
+  /** Routes paused after a failure, with ms left. */
+  paused: {} as Record<string, number>,
+  /** The most frequent failures since the ledger began (from the ledger). */
+  errors: [] as { what: string; stage: string; count: number; costUsd: number }[],
 };
 
 /** Gross needed before a cross-chain trade goes ahead (fees + ARB_MIN_PROFIT_USD), once fees are known. */
@@ -62,7 +62,8 @@ const freeRows = (statusRows: number) => (process.stdout.rows || 24) - 1 - statu
 
 /**
  * Every candidate route with its gross now, a sparkline of the window, and
- * its best in the window; the closest first. ETH routes are watch-only.
+ * its best in the window; the closest first. A route paused after a failure
+ * says so (it isn't traded until the pause ends).
  */
 function renderBoard(statusRows: number): string[] {
   const latest = history.at(-1);
@@ -77,19 +78,21 @@ function renderBoard(statusRows: number): string[] {
   const shown = (n: string) => (ascii ? toAscii(n) : n);
   const labelW = Math.max(...names.map((n) => shown(n).length), 10);
   const sw = Math.max(8, Math.min(60, cols - 2 - 9 - 2 - labelW - 2 - 15));
-  const eth = settings.watchEth
-    ? c.dim(` · ETH would have traded ${ui.eth.hits}×${ui.eth.hits ? ` (${usd(ui.eth.sumUsd, 3)} gross)` : ''}`)
-    : '';
-  const out = [`  ${c.bold('routes')} ${c.dim(`gross now · last ${span().slice(1)} · best`)}${eth}`];
+  const out = [`  ${c.bold('routes')} ${c.dim(`gross now · last ${span().slice(1)} · best`)}`];
   for (const name of names) {
     const now = latest.cands[name]!;
     const series = history.map((h) => h.cands[name] ?? null);
     const best = Math.max(...series.filter((v): v is number => v !== null));
     const paint = (bar: string, v: number) => (need !== null && v >= need ? c.yellow(bar) : v > 0 ? c.green(bar) : c.dim(bar));
     const spark = sparklineIn(charset, series, sw, extent(series, 0) ?? undefined, paint);
-    out.push(`  ${' '.repeat(Math.max(0, 8 - usd(now).length))}${usdColored(now)}  ${shown(name).padEnd(labelW)}  ${spark}  ${c.dim('best ' + usd(best))}`);
+    out.push(`  ${' '.repeat(Math.max(0, 8 - usd(now).length))}${usdColored(now)}  ${shown(name).padEnd(labelW)}  ${spark}  ${c.dim('best ' + usd(best))}${pausedNote(name)}`);
   }
   return out;
+}
+
+function pausedNote(route: string): string {
+  const ms = ui.paused[route];
+  return ms ? '  ' + c.yellow(`paused ${Math.max(1, Math.ceil(ms / 60_000))}m`) : '';
 }
 
 /** How far back the history goes, as an axis label: "-45s", "-5m". */
@@ -199,25 +202,12 @@ export function renderLive(): string[] {
     c.dim(` · last trade ${ui.lastTrade ?? 'none yet'}`);
 
   const lines = [line1, line2, line3];
+  if (ui.errors.length) {
+    const list = ui.errors.map((e) => `${e.count}× ${e.what} ${c.dim(`(${e.stage}${e.costUsd ? ` ${usd(e.costUsd, 3)}` : ''})`)}`);
+    lines.push(`  ${c.red('errors')} ${list.join(' · ')} ${c.dim('· npm run errors')}`);
+  }
   if (ui.skip) lines.push(c.dim(`  skipping: ${ui.skip}`));
   const board = renderBoard(lines.length);
   return [...lines, ...board, ...renderCharts(lines.length + board.length)];
-}
-
-/**
- * Count the ticks where the watched ETH route would have cleared fees + min
- * profit, and log each time it crosses that line (not every tick it stays above).
- */
-export function noteEthWatch(best: Watched | undefined): void {
-  const need = needed();
-  const above = Boolean(best && need !== null && best.grossUsd >= need);
-  if (above && best) {
-    ui.eth.hits += 1;
-    ui.eth.sumUsd += best.grossUsd;
-    if (!ui.eth.above) {
-      log.info(`${c.yellow('ETH watch')} ${best.label} at $${best.sizeUsd} would clear fees: gross ${usdColored(best.grossUsd)} vs needed ${usd(need!)} ${c.dim('(watch only, not traded)')}`);
-    }
-  }
-  ui.eth.above = above;
 }
 

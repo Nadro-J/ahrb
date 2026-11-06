@@ -11,19 +11,20 @@
  *
  * Stops on: Ctrl+C (finishes the current action first), the kill switch
  * (ARB_KILL=1 or a file named STOP in the data dir), the daily loss limit,
- * 3 failed arbs in a row, or an XCM that never arrives.
+ * or an XCM that never arrives. A failed trade doesn't stop it: the error is
+ * counted in the ledger (`npm run errors`) and the route pauses for a while.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHAIN_NAME, human, SYMS, type Chain } from './assets.js';
 import { connect, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
-import { bootstrap, dotPrices, typicalXchainFees, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
-import { noteEthWatch, recordSample, renderLive, settings, hhmm, ui } from './dashboard.js';
+import { bootstrap, dotPrices, missingAssets, typicalXchainFees, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
+import { recordSample, renderLive, settings, hhmm, ui } from './dashboard.js';
 import { c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
-import { Ledger } from './pnl.js';
-import { describe, findOpportunities, label, planRebalance, watchEth, type EthQuoter, type Limits, type Opportunity, type Quoter } from './strategy.js';
-import { ahQuoteIn, ahQuoteOut, ethQuoter, hyBuy, hySell, psmState } from './venues.js';
+import { errorKey, failStage, Ledger } from './pnl.js';
+import { Cooldowns, describe, findOpportunities, label, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
+import { ahQuoteIn, ahQuoteOut, hyBuy, hySell, psmState } from './venues.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const num = (name: string, fallback: number) => {
@@ -49,16 +50,12 @@ const config = {
   chartMinutes: num('ARB_CHART_MINUTES', 5),
   chartHeight: num('ARB_CHART_HEIGHT', 8),
   boardRows: num('ARB_BOARD_ROWS', 5),
-  watchEth: process.env.ARB_WATCH_ETH !== '0',
 };
-
-const MAX_FAILED_IN_A_ROW = 3;
 
 Object.assign(settings, {
   chartMinutes: config.chartMinutes,
   chartHeight: config.chartHeight,
   boardRows: config.boardRows,
-  watchEth: config.watchEth,
   minProfitUsd: config.minProfitUsd,
   maxDailyLossUsd: config.maxDailyLossUsd,
 });
@@ -72,11 +69,12 @@ function killSwitch(): string | null {
 
 function printBook(book: Book, p: Prices, ledger: Ledger): void {
   const cols = [...SYMS, 'dotUSD', 'HDX'] as const;
-  const dec: Record<(typeof cols)[number], number> = { DOT: 10, USDT: 6, USDC: 6, dotUSD: 6, HDX: 12 };
+  const dec: Record<(typeof cols)[number], number> = { DOT: 10, USDT: 6, USDC: 6, ETH: 18, dotUSD: 6, HDX: 12 };
+  const dp = (k: (typeof cols)[number]) => (k === 'ETH' ? 6 : k === 'DOT' ? 4 : 2);
   const cell = (v: string) => v.padStart(10);
   log.raw(c.dim(`             ${cols.map((k) => cell(k)).join('')}${cell('USD')}`));
   for (const ch of ['AH', 'HY'] as Chain[]) {
-    const vals = cols.map((k) => cell(book[ch][k] === 0n ? '·' : human(book[ch][k], dec[k]).toFixed(k === 'DOT' ? 4 : 2)));
+    const vals = cols.map((k) => cell(book[ch][k] === 0n ? '·' : human(book[ch][k], dec[k]).toFixed(dp(k))));
     log.raw(`  ${CHAIN_NAME[ch].padEnd(11)}${vals.join('')}${cell('$' + usdOf(book, p, ch).toFixed(2))}`);
   }
   const equity = usdOf(book, p);
@@ -98,6 +96,7 @@ function syncUi(book: Book, p: Prices, ledger: Ledger): void {
   ui.pnl = ledger.summary(ui.equity).total;
   ui.day = ledger.dayPnl();
   ui.arbs = { done: ledger.state.arbs.done, failed: ledger.state.arbs.failed };
+  ui.errors = ledger.topErrors(2).map(([id, e]) => ({ what: id.split(' ').slice(2).join(' '), stage: e.stage, count: e.count, costUsd: e.costUsd }));
 }
 
 async function main(): Promise<void> {
@@ -160,14 +159,20 @@ async function main(): Promise<void> {
       hySell: async (from, to, amount) => (await hySell(chains, from, to, amount))?.amountOut ?? null,
       hyBuy: async (from, to, amount) => (await hyBuy(chains, from, to, amount))?.amountIn ?? null,
     };
-    const ethQ: EthQuoter = ethQuoter(chains);
     printBook(book, p, ledger);
 
     if (!ledger.state.bootstrapped) await bootstrap(ctx);
-    else await ensureHydrationFeeCurrency(ctx);
+    else {
+      // An asset added since the first setup (e.g. ETH) gets set up on its own; failing that, trading goes on without it.
+      const missing = missingAssets(book, p);
+      if (missing.length) {
+        log.step(`no inventory yet for ${missing.join(', ')}: setting it up`);
+        await bootstrap(ctx, missing).catch((e) => log.error(`setup of ${missing.join(', ')} failed: ${e instanceof Error ? e.message : String(e)} — trading without it`));
+      } else await ensureHydrationFeeCurrency(ctx);
+    }
 
     let tick = 0;
-    let failedInARow = 0;
+    const cooldowns = new Cooldowns();
     let lastSkipped: string | null = null;
     syncUi(book, p, ledger);
     startLive(renderLive);
@@ -204,24 +209,20 @@ async function main(): Promise<void> {
           ui.fees = (await typicalXchainFees(ctx, p).catch(() => null)) ?? ui.fees;
         }
         const psm = await psmState(chains).catch(() => null);
-        const [opps, dot, eth] = await Promise.all([
-          findOpportunities(quoter, book, p, limits, psm, observe),
-          dotPrices(ctx, p),
-          config.watchEth ? watchEth(ethQ, p, limits).catch(() => []) : Promise.resolve([]),
-        ]);
+        const [opps, dot] = await Promise.all([findOpportunities(quoter, book, p, limits, psm, observe), dotPrices(ctx, p)]);
         ui.dot = dot;
         const near = closest as Opportunity | null;
         ui.closest = near ? { what: label(near), gross: near.grossUsd } : null;
-        for (const e of eth) cands[`${e.label} (watch)`] = e.grossUsd;
+        ui.paused = cooldowns.paused();
         recordSample(dot.ah, dot.hy, near?.grossUsd ?? null, cands);
-        noteEthWatch(eth[0]);
         if (near && (!ui.record || near.grossUsd > ui.record.gross)) ui.record = { what: label(near), gross: near.grossUsd, at: hhmm() };
 
         const spread = dot.hy ? ((dot.hy - dot.ah) / dot.ah) * 100 : null;
         const head =
           `#${tick} DOT ${c.cyan('$' + dot.ah.toFixed(4))} AH / ${c.cyan(dot.hy ? '$' + dot.hy.toFixed(4) : '?')} HY` +
           (spread !== null ? c.dim(` (${spread >= 0 ? '+' : ''}${spread.toFixed(2)}%)`) : '');
-        const best = opps[0];
+        // The best route that isn't paused after a recent failure.
+        const best = opps.find((o) => !cooldowns.pausedFor(label(o)));
         if (!best) {
           ui.skip = null;
           lastSkipped = null;
@@ -245,9 +246,17 @@ async function main(): Promise<void> {
             acted = true;
             ui.lastTrade = `${hhmm()} ${res.outcome === 'ok' ? 'ok' : 'failed'}`;
           }
-          if (res.outcome === 'failed') failedInARow += 1;
-          if (res.outcome === 'ok') failedInARow = 0;
-          if (failedInARow >= MAX_FAILED_IN_A_ROW) throw new Halt(`${failedInARow} failed arbs in a row`);
+          if (res.outcome === 'ok') cooldowns.ok(label(best));
+          if (res.outcome === 'failed') {
+            // Keep running; note it and rest the route so a broken one can't burn fees every tick.
+            const { ms, strikes } = cooldowns.fail(label(best));
+            const stage = failStage(res.error);
+            log.warn(
+              `${label(best)}: ${errorKey(res.error)} (${stage === 'dry-run' ? 'dry run, nothing sent' : stage === 'on-chain' ? 'on chain, fee paid' : stage})` +
+                ` · cost ${usd(res.realizedUsd)} · route paused ${Math.round(ms / 60_000)} min (failure ${strikes} in a row) · see npm run errors`
+            );
+            ui.paused = cooldowns.paused();
+          }
         }
 
         if (acted || (!liveEnabled && tick % config.summaryEvery === 0)) {

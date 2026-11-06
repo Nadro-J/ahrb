@@ -3,10 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { deltaUsd, usdOf, type Book, type Prices } from './chains.js';
-import { Ledger, type LedgerEntry } from './pnl.js';
+import { errorKey, failStage, Ledger, type LedgerEntry } from './pnl.js';
 
-const P: Prices = { DOT: 2, USDT: 1, USDC: 1, dotUSD: 1, HDX: 0.01 };
-const zero = () => ({ DOT: 0n, USDT: 0n, USDC: 0n, dotUSD: 0n, HDX: 0n });
+const P: Prices = { DOT: 2, USDT: 1, USDC: 1, ETH: 2000, dotUSD: 1, HDX: 0.01 };
+const zero = () => ({ DOT: 0n, USDT: 0n, USDC: 0n, ETH: 0n, dotUSD: 0n, HDX: 0n });
 const B = (ahUsdt: number, hyDot = 0): Book => ({
   AH: { ...zero(), USDT: BigInt(ahUsdt * 1e6) },
   HY: { ...zero(), DOT: BigInt(hyDot * 1e10) },
@@ -93,5 +93,37 @@ describe('Ledger', () => {
     const lines = fs.readFileSync(path.join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0]!).before.AH.USDT).toBe('40000000');
+  });
+});
+
+describe('error notes', () => {
+  it('names the pallet error and the stage it failed at', () => {
+    const chain = 'sell DOT→USDT failed in block 123: AssetConversion.ProvidedMinimumNotSufficientForSwap';
+    expect(errorKey(chain)).toBe('AssetConversion.ProvidedMinimumNotSufficientForSwap');
+    expect(failStage(chain)).toBe('on-chain');
+    expect(failStage('dry run failed: Token.FundsUnavailable')).toBe('dry-run');
+    expect(errorKey('Asset Hub (wss://x): no answer in 60s')).toBe('Asset Hub (wss://x): no answer in #s');
+  });
+
+  it('counts failures by kind, stage and error, with their cost', () => {
+    const ledger = Ledger.open(tmp(), 'acct', 40, P).ledger;
+    const fail = (error: string, realizedUsd: number) => ({ ...entry('arb', realizedUsd, false), error });
+    ledger.record(fail('swap failed in block 1: AssetConversion.ProvidedMinimumNotSufficientForSwap', -0.004));
+    ledger.record(fail('swap failed in block 9: AssetConversion.ProvidedMinimumNotSufficientForSwap', -0.003));
+    ledger.record(fail('dry run failed: Token.FundsUnavailable', 0));
+    const [top, second] = ledger.topErrors();
+    expect(top![0]).toBe('arb on-chain AssetConversion.ProvidedMinimumNotSufficientForSwap');
+    expect(top![1].count).toBe(2);
+    expect(top![1].costUsd).toBeCloseTo(-0.007);
+    expect(second![1].stage).toBe('dry-run');
+  });
+
+  it('reads state files written before errors were tracked', () => {
+    const dir = tmp();
+    const { ledger } = Ledger.open(dir, 'acct', 40, P);
+    const old = { ...ledger.state } as Partial<typeof ledger.state>;
+    delete old.errors;
+    fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify(old));
+    expect(Ledger.open(dir, 'acct', 40, P).ledger.state.errors).toEqual({});
   });
 });

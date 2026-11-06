@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { Sym } from './assets.js';
 import type { Book, Prices } from './chains.js';
-import { findOpportunities, planRebalance, RESERVE, sizeLadder, tradeable, watchEth, type EthQuoter, type Quoter } from './strategy.js';
+import { Cooldowns, findOpportunities, planRebalance, RESERVE, sizeLadder, tradeable, type Quoter } from './strategy.js';
 import { psmFee, type AhSym, type PsmState } from './venues.js';
 
-const P: Prices = { DOT: 1, USDT: 1, USDC: 1, dotUSD: 1, HDX: 0.01 };
-const DEC: Record<AhSym, number> = { DOT: 10, USDT: 6, USDC: 6, dotUSD: 6 };
+const P: Prices = { DOT: 1, USDT: 1, USDC: 1, ETH: 1, dotUSD: 1, HDX: 0.01 };
+const DEC: Record<AhSym, number> = { DOT: 10, USDT: 6, USDC: 6, ETH: 18, dotUSD: 6 };
 const LIMITS = { minTradeUsd: 1, maxTradeUsd: 5 };
 
 /**
@@ -42,10 +42,12 @@ function market(ah: Partial<Record<AhSym, number>>, hy: Partial<Record<Sym, numb
 
 const usd6 = (v: number) => BigInt(Math.round(v * 1e6));
 const dot = (v: number) => BigInt(Math.round(v * 1e10));
-function book(ah: [number, number, number], hy: [number, number, number], dotUsd = 0): Book {
+const eth = (v: number) => BigInt(Math.round(v * 1e6)) * 10n ** 12n;
+/** [DOT, USDT, USDC] per chain, optionally ETH; ETH defaults to none, so its routes can't be funded. */
+function book(ah: [number, number, number], hy: [number, number, number], dotUsd = 0, ethEach = 0): Book {
   return {
-    AH: { DOT: dot(ah[0]), USDT: usd6(ah[1]), USDC: usd6(ah[2]), dotUSD: usd6(dotUsd), HDX: 0n },
-    HY: { DOT: dot(hy[0]), USDT: usd6(hy[1]), USDC: usd6(hy[2]), dotUSD: 0n, HDX: 0n },
+    AH: { DOT: dot(ah[0]), USDT: usd6(ah[1]), USDC: usd6(ah[2]), ETH: eth(ethEach), dotUSD: usd6(dotUsd), HDX: 0n },
+    HY: { DOT: dot(hy[0]), USDT: usd6(hy[1]), USDC: usd6(hy[2]), ETH: eth(ethEach), dotUSD: 0n, HDX: 0n },
   };
 }
 const EVEN = book([7, 7, 7], [7, 7, 7]);
@@ -68,6 +70,17 @@ describe('findOpportunities: cross-chain', () => {
     expect(opps).toEqual([]);
     expect(seen).toHaveLength(12); // 6 ordered pairs × 2 directions, each stops after its first losing size
     expect(Math.max(...seen)).toBeLessThan(0);
+  });
+
+  it('trades ETH like the other assets once both chains hold it', async () => {
+    const seen = new Set<string>();
+    const funded = book([7, 7, 7], [7, 7, 7], 0, 7);
+    const opps = await findOpportunities(market({}, { ETH: 1.02 }), funded, P, LIMITS, null, (o) => {
+      if (o.kind === 'xchain') seen.add(`${o.base}/${o.quote}`);
+    });
+    expect(seen.size).toBe(12); // every ordered pair of 4 assets
+    const best = opps[0]!;
+    expect(best.kind === 'xchain' && best.base === 'ETH' && best.sellOn === 'HY').toBe(true);
   });
 
   it('sells DOT where it is dear and buys it back where it is cheap', async () => {
@@ -177,29 +190,23 @@ describe('planRebalance', () => {
   });
 });
 
-describe('watchEth', () => {
-  // ETH at $2000 against DOT at $1; `hyPremium` makes ETH dearer on Hydration. Each leg costs `fee`.
-  const quoter = (hyPremium: number, fee = 0.003): EthQuoter => {
-    const dot = (usd: number) => BigInt(Math.round(usd * 1e10));
-    const usdOf = (eth: bigint, px: number) => (Number(eth) / 1e18) * px;
-    return {
-      ahSellEth: async (e) => dot(usdOf(e, 2000) * (1 - fee)),
-      ahBuyEth: async (e) => dot(usdOf(e, 2000) / (1 - fee)),
-      hySellEth: async (e) => dot(usdOf(e, 2000 * (1 + hyPremium)) * (1 - fee)),
-      hyBuyEth: async (e) => dot(usdOf(e, 2000 * (1 + hyPremium)) / (1 - fee)),
-    };
-  };
-
-  it('reports both directions, losing ones at the smallest size', async () => {
-    const w = await watchEth(quoter(0), P, LIMITS);
-    expect(w.map((x) => x.label).sort()).toEqual(['ETH/DOT sell AH→buy HY', 'ETH/DOT sell HY→buy AH']);
-    expect(w.every((x) => x.grossUsd < 0 && x.sizeUsd === 1)).toBe(true);
+describe('Cooldowns', () => {
+  it('pauses a failed route, doubling with each failure in a row, up to the cap', () => {
+    const cd = new Cooldowns(60_000, 4 * 60_000);
+    expect(cd.fail('r', 0)).toEqual({ ms: 60_000, strikes: 1 });
+    expect(cd.pausedFor('r', 30_000)).toBe(30_000);
+    expect(cd.pausedFor('r', 60_000)).toBe(0);
+    expect(cd.fail('r', 61_000).ms).toBe(120_000);
+    expect(cd.fail('r', 200_000).ms).toBe(240_000);
+    expect(cd.fail('r', 500_000).ms).toBe(240_000); // capped
+    expect(cd.pausedFor('other', 500_000)).toBe(0);
   });
 
-  it('sells where ETH is dear and walks up the ladder while it pays', async () => {
-    const [best] = await watchEth(quoter(0.02), P, LIMITS);
-    expect(best!.label).toBe('ETH/DOT sell HY→buy AH');
-    expect(best!.grossUsd).toBeGreaterThan(0);
-    expect(best!.sizeUsd).toBe(5);
+  it('forgets a route after a success or a long quiet spell', () => {
+    const cd = new Cooldowns(60_000, 4 * 60_000);
+    cd.fail('r', 0);
+    cd.ok('r');
+    expect(cd.fail('r', 1000).strikes).toBe(1);
+    expect(cd.fail('r', 1000 + 60_000 + 4 * 60_000 + 1).strikes).toBe(1);
   });
 });
