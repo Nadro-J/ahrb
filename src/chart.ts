@@ -90,21 +90,26 @@ function xAxis(width: number, labelWidth: number, leftLabel: string, cs: Charset
 /**
  * Scatter-style line plot of one or more series on a shared scale, `height`
  * rows tall. Where two series land on the same cell the overlap glyph is drawn.
- * Returns the rows top first, with the y axis and the time axis.
+ * `level` draws a dotted reference line (e.g. a $1 peg), and the range is
+ * widened to include it. Returns the rows top first, with the y axis and the
+ * time axis.
  */
 export function linePlot(
   series: Series[],
   width: number,
   height: number,
   fmtY: (v: number) => string,
-  opts: { charset: Charset; labelWidth: number; leftLabel: string }
+  opts: { charset: Charset; labelWidth: number; leftLabel: string; level?: { value: number; paint?: (s: string) => string } }
 ): string[] {
   const g = GLYPHS[opts.charset];
   const cols = series.map((s) => resample(s.values, width));
-  const range = extent(cols.flat());
-  if (!range) return [];
-  const [min, max] = range;
-  const grid: string[][] = Array.from({ length: height }, () => Array(width).fill(' '));
+  const range = extent(cols.flat(), opts.level?.value);
+  if (!range || !cols.some((c) => c.some((v) => v !== null))) return [];
+  let [min, max] = range;
+  if (max === min) [min, max] = [min - 1e-4, max + 1e-4];
+  const levelRow = opts.level ? Math.round(((max - opts.level.value) / (max - min)) * (height - 1)) : -1;
+  const levelMark = (opts.level?.paint ?? id)(g.line);
+  const grid: string[][] = Array.from({ length: height }, (_, y) => Array(width).fill(y === levelRow ? levelMark : ' '));
   const owner: number[][] = Array.from({ length: height }, () => Array(width).fill(-1));
   cols.forEach((vals, si) => {
     vals.forEach((v, x) => {
@@ -116,6 +121,7 @@ export function linePlot(
     });
   });
   const labels = yLabels(height, min, max, fmtY, opts.labelWidth);
+  if (levelRow >= 0) labels[levelRow] = fmtY(opts.level!.value).padStart(opts.labelWidth);
   return [...grid.map((r, i) => `${labels[i]} ${g.axis}${r.join('')}`), ...xAxis(width, opts.labelWidth, opts.leftLabel, opts.charset).split('\n')];
 }
 

@@ -123,6 +123,12 @@ export async function readBook(c: Chains, w: Wallet): Promise<Book> {
   };
 }
 
+/** Just the Asset Hub USDT balance: one query, for the PSM fast lane (which only spends that). */
+export async function readAhUsdt(c: Chains, w: Wallet): Promise<bigint> {
+  const a = (await c.ah.query.Assets.Account.getValue(ASSETS.USDT.ahIndex!, w.ah, BEST)) as { balance: bigint } | undefined;
+  return a?.balance ?? 0n;
+}
+
 /** USD prices used to value the book: DOT from the AH DOT/USDT pool, ETH from the AH DOT/ETH pool, stables at $1, HDX from Hydration's router. */
 export interface Prices {
   DOT: number;

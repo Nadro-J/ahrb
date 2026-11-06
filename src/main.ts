@@ -4,10 +4,12 @@
  *
  *   ARB_MNEMONIC="word1 … word12" npm start
  *
- * Every tick: read balances and prices on both chains, quote every candidate
- * (cross-chain DOT/USDT/USDC spreads and the Asset Hub PSM peg), and execute
- * the best one only if it is still profitable after every fee. XCM moves
- * inventory between the chains only when a side runs too low to trade.
+ * Every tick: read balances and prices on both chains, quote every
+ * cross-chain candidate (DOT/USDT/USDC/ETH spreads), and execute the best one
+ * only if it is still profitable after every fee. The dotUSD PSM loops run in
+ * a fast lane on every new Asset Hub block (ARB_PSM_FAST=0 folds them back
+ * into the tick). XCM moves inventory between the chains only when a side
+ * runs too low to trade.
  *
  * Stops on: Ctrl+C (finishes the current action first), the kill switch
  * (ARB_KILL=1 or a file named STOP in the data dir), the daily loss limit,
@@ -18,13 +20,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHAIN_NAME, human, SYMS, type Chain } from './assets.js';
-import { connect, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
+import { connect, readAhUsdt, readBook, readPrices, usdOf, walletFromMnemonic, type Book, type Prices } from './chains.js';
 import { bootstrap, dotPrices, missingAssets, typicalXchainFees, ensureHydrationFeeCurrency, executeArb, Halt, rebalance, type Ctx } from './executor.js';
 import { recordSample, renderLive, settings, hhmm, ui } from './dashboard.js';
 import { c, liveEnabled, log, startLive, stopLive, usd, usdColored } from './log.js';
 import { errorKey, failStage, Ledger } from './pnl.js';
-import { Cooldowns, describe, findOpportunities, label, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
-import { ahQuoteIn, ahQuoteOut, hyBuy, hySell, psmState } from './venues.js';
+import { duration, type Period } from './periods.js';
+import { Cooldowns, describe, findOpportunities, findPsm, findXchain, label, pegPrice, planRebalance, type Limits, type Opportunity, type Quoter } from './strategy.js';
+import { ahQuoteIn, ahQuoteOut, hyBuy, hySell, psmState, type PsmState } from './venues.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const num = (name: string, fallback: number) => {
@@ -50,7 +53,32 @@ const config = {
   chartMinutes: num('ARB_CHART_MINUTES', 5),
   chartHeight: num('ARB_CHART_HEIGHT', 8),
   boardRows: num('ARB_BOARD_ROWS', 5),
+  psmMaxTradeUsd: num('ARB_PSM_MAX_TRADE_USD', 25),
+  psmFast: process.env.ARB_PSM_FAST !== '0',
 };
+
+/**
+ * One action at a time. `measured()` reads the book before and after an
+ * action; two actions overlapping (the tick and the PSM lane) would each be
+ * charged the other's effect.
+ */
+class Lock {
+  private tail: Promise<unknown> = Promise.resolve();
+  held = false;
+
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const r = this.tail.then(async () => {
+      this.held = true;
+      try {
+        return await fn();
+      } finally {
+        this.held = false;
+      }
+    });
+    this.tail = r.catch(() => undefined);
+    return r;
+  }
+}
 
 Object.assign(settings, {
   chartMinutes: config.chartMinutes,
@@ -78,16 +106,23 @@ function printBook(book: Book, p: Prices, ledger: Ledger): void {
     log.raw(`  ${CHAIN_NAME[ch].padEnd(11)}${vals.join('')}${cell('$' + usdOf(book, p, ch).toFixed(2))}`);
   }
   const equity = usdOf(book, p);
-  const s = ledger.summary(equity);
-  const a = ledger.state.arbs;
   syncUi(book, p, ledger);
+  const line = (name: string, x: Period | null) =>
+    x
+      ? `  ${c.bold(name.padEnd(9))} trading ${usdColored(x.trading)} ${c.dim(`(arb ${usd(x.arb)} · rebalance ${usd(x.rebalance)}${x.setup ? ` · setup ${usd(x.setup)}` : ''})`)}` +
+        ` · market ${x.market === null ? c.dim('?') : usdColored(x.market)}` +
+        c.dim(` · ${x.arbs} arbs, ${x.profitable} profitable, ${x.failed} failed`)
+      : '';
+  const sess = ledger.sessionPnl(equity);
+  log.raw(`  ${c.bold('Equity')} $${equity.toFixed(2)} ${c.dim(`(DOT $${p.DOT.toFixed(4)} · ETH $${p.ETH.toFixed(0)})`)}`);
+  if (sess) log.raw(line(`session ${duration(Date.now() - Date.parse(sess.startedAt))}`, sess.period));
+  log.raw(line('last 24h', ledger.windowPnl(24, equity)));
+  const all = ledger.summary(equity);
   log.raw(
-    `  ${c.bold('Equity')} $${equity.toFixed(2)} ${c.dim(`(DOT $${p.DOT.toFixed(4)})`)}  ` +
-      `${c.bold('P&L')} ${usdColored(s.total)} = arb ${usdColored(s.arb)} · setup ${usdColored(s.setup)} · rebalance ${usdColored(s.rebalance)} · market ${usdColored(s.market)}`
-  );
-  log.raw(
-    `  ${c.dim(`baseline $${ledger.state.baseline.usd.toFixed(2)} since ${ledger.state.baseline.at.slice(0, 16)} · ` +
-      `arbs ${a.done} (${a.profitable} profitable, ${a.failed} failed) · today ${usd(ledger.dayPnl())} of −$${config.maxDailyLossUsd} limit`)}`
+    c.dim(
+      `  all time  ${usd(all.total)} since ${ledger.state.baseline.at.slice(0, 16)} (arb ${usd(all.arb)} · setup ${usd(all.setup)} · rebalance ${usd(all.rebalance)} · market ${usd(all.market)})` +
+        ` · today ${usd(ledger.dayPnl())} of −$${config.maxDailyLossUsd} limit · npm run pnl`
+    )
   );
 }
 
@@ -97,6 +132,9 @@ function syncUi(book: Book, p: Prices, ledger: Ledger): void {
   ui.day = ledger.dayPnl();
   ui.arbs = { done: ledger.state.arbs.done, failed: ledger.state.arbs.failed };
   ui.errors = ledger.topErrors(2).map(([id, e]) => ({ what: id.split(' ').slice(2).join(' '), stage: e.stage, count: e.count, costUsd: e.costUsd }));
+  const sess = ledger.sessionPnl(ui.equity);
+  ui.session = sess ? { since: Date.parse(sess.startedAt), period: sess.period } : null;
+  ui.last24 = ledger.windowPnl(24, ui.equity);
 }
 
 async function main(): Promise<void> {
@@ -109,7 +147,7 @@ async function main(): Promise<void> {
   log.raw(`  account     ${w.ah} ${c.dim(`(Hydration ${w.hy})`)}`);
   log.raw(
     c.dim(
-      `  trade $${config.minTradeUsd}–$${config.maxTradeUsd} · min profit $${config.minProfitUsd} · ` +
+      `  trade $${config.minTradeUsd}–$${config.maxTradeUsd} (PSM up to $${config.psmMaxTradeUsd}${config.psmFast ? ', every block' : ''}) · min profit $${config.minProfitUsd} · ` +
         `daily loss limit $${config.maxDailyLossUsd} · tick ${config.pollSeconds}s · data ${config.dataDir}\n`
     )
   );
@@ -143,6 +181,8 @@ async function main(): Promise<void> {
   // With the terminal gone, writes fail with EIO; finishing the current step matters more than the output.
   process.stdout.on('error', () => {});
 
+  let laneSub: { unsubscribe(): void } | null = null;
+  let ledgerRef: Ledger | null = null;
   try {
     let [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
     // Checked before the ledger exists: its first equity reading becomes the P&L baseline.
@@ -150,9 +190,10 @@ async function main(): Promise<void> {
       throw new Halt(`account holds $${usdOf(book, p).toFixed(2)} — fund ${w.ah} on Asset Hub first (e.g. 40 USDT)`);
     }
     const { ledger, fresh } = Ledger.open(config.dataDir, w.ah, usdOf(book, p), p);
+    ledgerRef = ledger;
     if (fresh) log.ok(`new ledger: baseline equity $${ledger.state.baseline.usd.toFixed(2)}`);
     const ctx: Ctx = { c: chains, w, ledger, minProfitUsd: config.minProfitUsd };
-    const limits: Limits = { minTradeUsd: config.minTradeUsd, maxTradeUsd: config.maxTradeUsd };
+    const limits: Limits = { minTradeUsd: config.minTradeUsd, maxTradeUsd: config.maxTradeUsd, psmMaxTradeUsd: config.psmMaxTradeUsd };
     const quoter: Quoter = {
       ahIn: (pathSyms, amount) => ahQuoteIn(chains, pathSyms, amount),
       ahOut: (pathSyms, amount) => ahQuoteOut(chains, pathSyms, amount),
@@ -171,11 +212,100 @@ async function main(): Promise<void> {
       } else await ensureHydrationFeeCurrency(ctx);
     }
 
-    let tick = 0;
+    [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
+    ledger.startSession(usdOf(book, p));
+    const lock = new Lock();
     const cooldowns = new Cooldowns();
     let lastSkipped: string | null = null;
+
+    /** Execute one opportunity and handle the outcome: log, cooldown, status. Returns whether anything was sent. */
+    const act = async (best: Opportunity, prices: Prices, psm: PsmState | null, head: string): Promise<boolean> => {
+      ui.phase = 'trading';
+      const res = await executeArb(ctx, best, prices, psm);
+      if (res.outcome === 'skipped') {
+        // A spread that is too thin to trade can last for hours; print it once, keep it in the status.
+        const key = `${label(best)}|${res.reason.replace(/[-+$\d.]+/g, '')}`;
+        if (!liveEnabled || key !== lastSkipped) {
+          log.info(`${head} · best: ${describe(best, prices)} · gross ${usdColored(best.grossUsd)}`);
+          log.info(c.dim(`  skip: ${res.reason}`));
+        }
+        lastSkipped = key;
+        ui.skip = `${label(best)}: ${res.reason}`;
+        return false;
+      }
+      lastSkipped = null;
+      ui.skip = null;
+      ui.lastTrade = `${hhmm()} ${label(best)} ${res.outcome === 'ok' ? 'ok' : 'failed'}`;
+      if (res.outcome === 'ok') cooldowns.ok(label(best));
+      else {
+        // Keep running; note it and rest the route so a broken one can't burn fees every tick.
+        const { ms, strikes } = cooldowns.fail(label(best));
+        const stage = failStage(res.error);
+        log.warn(
+          `${label(best)}: ${errorKey(res.error)} (${stage === 'dry-run' ? 'dry run, nothing sent' : stage === 'on-chain' ? 'on chain, fee paid' : stage})` +
+            ` · cost ${usd(res.realizedUsd)} · route paused ${Math.round(ms / 60_000)} min (failure ${strikes} in a row) · see npm run errors`
+        );
+      }
+      ui.paused = cooldowns.paused();
+      return true;
+    };
+
+    /* --------------------------------------------- PSM fast lane, every AH block */
+
+    let psmCache: { at: number; state: PsmState | null } | null = null;
+    const psmNow = async () => {
+      if (!psmCache || Date.now() - psmCache.at > 60_000) psmCache = { at: Date.now(), state: await psmState(chains).catch(() => null) };
+      return psmCache.state;
+    };
+    /** The latest PSM quotes, for the board and the nearest-trade line. */
+    let lanePsm: { cands: Record<string, number>; best: Opportunity | null } = { cands: {}, best: null };
+    const notePeg = (o: Opportunity) => {
+      const peg = pegPrice(o);
+      if (peg && !ui.pegSeen[peg.side]) {
+        ui.pegSeen[peg.side] = true; // the smallest size quotes the price
+        ui.peg[peg.side] = peg.price;
+      }
+    };
+    let laneBusy = false;
+    const psmLane = async () => {
+      if (laneBusy || stopping || lock.held) return;
+      laneBusy = true;
+      try {
+        const psm = await psmNow();
+        if (!psm) return;
+        const b: Book = { ...book, AH: { ...book.AH, USDT: await readAhUsdt(chains, w) } };
+        const cands: Record<string, number> = {};
+        let near: Opportunity | null = null;
+        ui.pegSeen = { sell: false, buy: false };
+        const opps = await findPsm(quoter, b, p, limits, psm, (o) => {
+          notePeg(o);
+          cands[label(o)] = Math.max(cands[label(o)] ?? -Infinity, o.grossUsd);
+          if (!near || o.grossUsd > near.grossUsd) near = o;
+        });
+        lanePsm = { cands, best: near };
+        const best = opps.find((o) => !cooldowns.pausedFor(label(o)));
+        if (!best || stopping || ledger.dayPnl() <= -config.maxDailyLossUsd) return;
+        const head = `PSM dotUSD sell ${ui.peg.sell?.toFixed(4) ?? '?'} / buy ${ui.peg.buy?.toFixed(4) ?? '?'}`;
+        if (lock.held) return; // the tick is acting; the next block will look again
+        const acted = await lock.run(() => act(best, p, psm, head));
+        if (acted) {
+          const [b2, p2] = await Promise.all([readBook(chains, w), readPrices(chains)]);
+          book = b2;
+          printBook(b2, p2, ledger);
+        }
+      } catch (e) {
+        log.error(`PSM lane: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        laneBusy = false;
+      }
+    };
+
+    /* ------------------------------------------------------------ main tick */
+
+    let tick = 0;
     syncUi(book, p, ledger);
     startLive(renderLive);
+    if (config.psmFast) laneSub = chains.ahClient.bestBlocks$.subscribe(() => void psmLane());
     while (!stopping) {
       tick += 1;
       ui.tick = tick;
@@ -185,13 +315,14 @@ async function main(): Promise<void> {
 
       try {
         [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
+        ledger.touch(usdOf(book, p));
         let acted = false;
 
         syncUi(book, p, ledger);
         const moves = planRebalance(book, p, limits);
         if (moves.length) {
           ui.phase = 'rebalancing';
-          await rebalance(ctx, moves);
+          await lock.run(() => rebalance(ctx, moves));
           acted = true;
           [book, p] = await Promise.all([readBook(chains, w), readPrices(chains)]);
         }
@@ -200,6 +331,7 @@ async function main(): Promise<void> {
         let closest: Opportunity | null = null;
         const cands: Record<string, number> = {};
         const observe = (o: Opportunity) => {
+          if (!config.psmFast) notePeg(o);
           if (!closest || o.grossUsd > closest.grossUsd) closest = o;
           const k = label(o);
           cands[k] = Math.max(cands[k] ?? -Infinity, o.grossUsd);
@@ -208,13 +340,22 @@ async function main(): Promise<void> {
           ui.feesAt = Date.now();
           ui.fees = (await typicalXchainFees(ctx, p).catch(() => null)) ?? ui.fees;
         }
-        const psm = await psmState(chains).catch(() => null);
-        const [opps, dot] = await Promise.all([findOpportunities(quoter, book, p, limits, psm, observe), dotPrices(ctx, p)]);
+        const psm = config.psmFast ? null : await psmNow();
+        if (!config.psmFast) ui.pegSeen = { sell: false, buy: false };
+        const [opps, dot] = await Promise.all([
+          config.psmFast ? findXchain(quoter, book, p, limits, observe) : findOpportunities(quoter, book, p, limits, psm, observe),
+          dotPrices(ctx, p),
+        ]);
+        if (config.psmFast) {
+          Object.assign(cands, lanePsm.cands);
+          const lb = lanePsm.best;
+          if (lb && (!closest || lb.grossUsd > (closest as Opportunity).grossUsd)) closest = lb;
+        }
         ui.dot = dot;
         const near = closest as Opportunity | null;
         ui.closest = near ? { what: label(near), gross: near.grossUsd } : null;
         ui.paused = cooldowns.paused();
-        recordSample(dot.ah, dot.hy, near?.grossUsd ?? null, cands);
+        recordSample(dot.ah, dot.hy, near?.grossUsd ?? null, cands, Date.now(), { ...ui.peg });
         if (near && (!ui.record || near.grossUsd > ui.record.gross)) ui.record = { what: label(near), gross: near.grossUsd, at: hhmm() };
 
         const spread = dot.hy ? ((dot.hy - dot.ah) / dot.ah) * 100 : null;
@@ -228,36 +369,7 @@ async function main(): Promise<void> {
           lastSkipped = null;
           // On a terminal the live status shows this; a log file gets a line per tick.
           if (!liveEnabled) log.info(`${head} · ${c.dim('no edge after pool fees')}`);
-        } else {
-          ui.phase = 'trading';
-          const res = await executeArb(ctx, best, p, psm);
-          if (res.outcome === 'skipped') {
-            // A spread that is too thin to trade can last for hours; print it once, keep it in the status.
-            const key = `${label(best)}|${res.reason.replace(/[-+$\d.]+/g, '')}`;
-            if (!liveEnabled || key !== lastSkipped) {
-              log.info(`${head} · best: ${describe(best, p)} · gross ${usdColored(best.grossUsd)}`);
-              log.info(c.dim(`  skip: ${res.reason}`));
-            }
-            lastSkipped = key;
-            ui.skip = `${label(best)}: ${res.reason}`;
-          } else {
-            lastSkipped = null;
-            ui.skip = null;
-            acted = true;
-            ui.lastTrade = `${hhmm()} ${res.outcome === 'ok' ? 'ok' : 'failed'}`;
-          }
-          if (res.outcome === 'ok') cooldowns.ok(label(best));
-          if (res.outcome === 'failed') {
-            // Keep running; note it and rest the route so a broken one can't burn fees every tick.
-            const { ms, strikes } = cooldowns.fail(label(best));
-            const stage = failStage(res.error);
-            log.warn(
-              `${label(best)}: ${errorKey(res.error)} (${stage === 'dry-run' ? 'dry run, nothing sent' : stage === 'on-chain' ? 'on chain, fee paid' : stage})` +
-                ` · cost ${usd(res.realizedUsd)} · route paused ${Math.round(ms / 60_000)} min (failure ${strikes} in a row) · see npm run errors`
-            );
-            ui.paused = cooldowns.paused();
-          }
-        }
+        } else if (await lock.run(() => act(best, p, psm, head))) acted = true;
 
         if (acted || (!liveEnabled && tick % config.summaryEvery === 0)) {
           const [b2, p2] = await Promise.all([readBook(chains, w), readPrices(chains)]);
@@ -280,8 +392,12 @@ async function main(): Promise<void> {
         wake = null;
       }
     }
+    laneSub?.unsubscribe();
+    laneSub = null;
+    await lock.run(async () => undefined); // let a PSM trade in flight finish
     log.warn('stopped');
     const [b, pr] = await Promise.all([readBook(chains, w), readPrices(chains)]);
+    ledger.touch(usdOf(b, pr), new Date(), true);
     printBook(b, pr, ledger);
   } catch (e) {
     if (e instanceof Halt) {
@@ -289,6 +405,8 @@ async function main(): Promise<void> {
       process.exitCode = 2;
     } else throw e;
   } finally {
+    laneSub?.unsubscribe();
+    if (ledgerRef) ledgerRef.touch(ui.equity, new Date(), true);
     stopLive();
     chains.destroy();
   }

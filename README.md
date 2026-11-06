@@ -104,6 +104,16 @@ quotes every candidate:
 | **psm-mint** | USDT → PSM mint → dotUSD → sell on the pool for USDT (when dotUSD trades above $1) | Yes, one `utility.batch_all` |
 | **psm-redeem** | USDT → buy dotUSD on the pool → PSM redeem → USDT (when dotUSD trades below $1) | Yes, one `utility.batch_all` |
 
+The PSM loops run in their own **fast lane**: on every new Asset Hub block
+(about every 2–3 s), not every tick, because other traders work the same
+pool and the first one in takes the gap. They size up to
+`ARB_PSM_MAX_TRADE_USD` ($25), separately from the cross-chain cap. They are
+atomic, need only USDT on Asset Hub, and the dotUSD/DOT pool is deep (about
+$88k on 2026-11-06; $50 costs only ~0.1 % more than $1). **The USDT on Asset
+Hub is the real limit on PSM size**, so keep some there (see
+[dotUSD](#dotusd)). Only one action runs at a time: the fast lane waits for
+the tick's trade and the other way round.
+
 The search starts at the minimum size and walks up a size ladder ($1 … $5) for
 as long as the profit grows. For the best candidate it estimates the real
 network fees of the actual transactions. It executes only if
@@ -123,18 +133,56 @@ before it. That gives what the action really earned or cost, with every fee
 included (pool, PSM, tx fees on both chains, XCM delivery and execution) and
 market moves left out.
 
+P&L is reported **by time**: for each session (one run of the bot, from start
+to stop) and for rolling windows (last 1h, 12h, 24h, 7d), each split in two:
+
+- **trading**: what the bot's own actions made: arbs (failed ones included),
+  setup and rebalances. This is the number that says whether the bot works.
+- **market**: everything else the equity did, i.e. holding DOT and ETH while
+  their prices move. With about half the inventory in DOT and ETH, this is
+  usually much bigger than trading, in either direction.
+- **total** = trading + market. Deposits recorded with `npm run deposit` are
+  left out.
+
+The live status shows the session and the last 24h. `npm run pnl` prints the
+windows, the last sessions and each day, from the data files alone. An
+example (the Pi's trades with made-up sessions and snapshots):
+
 ```
-  Equity $39.71 (DOT $0.9286)  P&L -$0.29 = arb +$0.03 · setup -$0.24 · rebalance -$0.03 · market -$0.05
+P&L  (trading = what the bot's actions made; market = holding the coins; total = both)
+
+Rolling windows to 2026-11-06 11:50 (last snapshot, equity $49.59)
+  window                    trading        arb  rebalance     market      total
+  last 1h                  +$0.0183   +$0.0218   -$0.0035   -$0.0283   -$0.0100   1 arbs, 1 profitable, 0 failed
+  last 12h                 +$0.0183   +$0.0218   -$0.0035   -$0.4883   -$0.4700   1 arbs, 1 profitable, 0 failed
+  last 24h                 +$0.0171   +$0.0206   -$0.0035   -$0.5171   -$0.5000   1 arbs, 1 profitable, 4 failed
+  last 7d (partial)        +$0.0273   +$0.0308   -$0.0035          ?          ?   2 arbs, 2 profitable, 5 failed
+
+Sessions (each run of the bot; last 2 of 2)
+  started · ran for         trading        arb  rebalance     market      total
+  11-04 19:00 · 19h00m     +$0.0090   +$0.0090    $0.0000   -$0.3090   -$0.3000   1 arbs, 1 profitable, 5 failed
+  11-06 09:30 · 2h30m      +$0.0183   +$0.0218   -$0.0035   -$0.2183   -$0.2000   1 arbs, 1 profitable, 0 failed
+
+Days (UTC)
+  day                       trading        arb  rebalance     market      total
+  2026-11-04 (partial)     -$0.0015   -$0.0015    $0.0000          ?          ?   0 arbs, 0 profitable, 1 failed
+  2026-11-05               +$0.0104   +$0.0104    $0.0000   -$0.0504   -$0.0400   1 arbs, 1 profitable, 4 failed
+  2026-11-06               +$0.0183   +$0.0218   -$0.0035   -$0.4883   -$0.4700   1 arbs, 1 profitable, 0 failed
+
+  all time: trading +$0.0273 since 2026-11-04 09:23 · baseline $50.19 (incl. 1 deposit)
 ```
 
-- **total**: equity now minus equity at the first funded run (the baseline)
-- **arb**: the measured result of every arb, including failed ones
-- **setup / rebalance**: what inventory management cost
-- **market**: the rest, i.e. holding DOT while its price moves
+`partial` means the window starts before the first equity snapshot, so only
+trading is known. Files in `data/`:
 
-`data/state.json` holds the running totals. `data/ledger.jsonl` has one
-line per action: the expected and realized amounts, the tx hashes, and the
-balances before and after. Delete both files to start a fresh baseline.
+- `ledger.jsonl`: one line per action, with the expected and realized
+  amounts, the tx hashes, and the balances before and after
+- `equity.jsonl`: equity every 10 minutes while the bot runs (the start of
+  each rolling window)
+- `state.json`: the sessions, the deposits, the all-time totals and the error
+  counts
+
+Delete all three to start fresh.
 
 ## Stopping
 
@@ -187,6 +235,8 @@ All settings come from the environment (or `.env`):
 | `ARB_CHART_HEIGHT` | `8` | rows for the price chart (the trade chart gets ~60 %); `1` = one-line sparklines |
 | `ARB_ASCII` | none | `1` prints plain ASCII only, for fonts that show boxes |
 | `ARB_BOARD_ROWS` | `5` | routes shown on the board; `0` hides it |
+| `ARB_PSM_MAX_TRADE_USD` | `25` | largest PSM trade (also limited by the USDT on Asset Hub) |
+| `ARB_PSM_FAST` | on | `0` checks the PSM once per tick instead of on every Asset Hub block |
 
 ## Screen output
 
@@ -195,53 +245,69 @@ place every second instead of printing a line every tick:
 
 ```
 ● LIVE #150 up 15m · DOT $0.9531 AH / $0.9524 HY (-0.07%) · next check 4s
-  nearest trade -$0.0035 DOT/USDT sell AH→buy HY · best since start +$0.0021 at 14:02
-  equity $40.12 · P&L -$0.07 · today  $0.00 (halt at −$2) · arbs 2 (1 failed) · last trade 13:40 ok
+  nearest trade -$0.0035 psm-mint · best since start +$0.0021 at 14:02 · dotUSD 0.9951/1.0071
+  session 3h15m  trading +$0.0183 (2 arbs, 1 failed) · market -$0.21
+  last 24h  trading +$0.0337 (3 arbs, 4 failed) · market -$0.52 · equity $40.12 · today  $0.00 (halt at −$2) · last trade 13:40 ok
   errors 3× AssetConversion.ProvidedMinimumNotSufficientForSwap (on-chain -$0.011) · 1× Token.FundsUnavailable (dry-run) · npm run errors
   routes gross now · last 15m · best
-  -$0.0054  ETH/DOT sell HY→buy AH    ▁▁▁▃▅▇█▆▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▄▆█▇▄▂  best +$0.0060
-  -$0.0062  psm-redeem                ▃▄▄▄▅▅▅▅▄▄▄▃▃▂▂▁▁▁▁▁▁▂▂▃▃▄▄▅▅▅▅▅▄  best -$0.0050
-  -$0.0062  DOT/USDT sell AH→buy HY   ▄▆▇▇▆▅▄▃▁▁▁▂▄▅▆▇▇▆▅▃▂▁▁▂▃▅▆▇▇▆▅▄▂  best -$0.0010  paused 3m
-  -$0.0078  DOT/USDC sell HY→buy AH   ▃▃▃▄▄▄▄▄▄▄▄▄▃▃▃▂▂▂▁▁▁▁▁▁▁▁▂▂▂▃▃▃▄  best -$0.0070
-  -$0.0087  USDT/USDC sell AH→buy HY  ▄▄▅▅▆▆▅▅▄▃▂▂▁▁▁▁▂▃▄▄▅▅▆▆▅▅▄▃▂▂▁▁▁  best -$0.0030
+  -$0.0054  ETH/DOT sell HY→buy AH    ▁▁▁▁▃▅▇█▇▅▃▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▅▇█▇▅▃▂  best +$0.0060
+  -$0.0062  USDT/USDC sell AH→buy HY  ▃▃▄▄▄▅▅▅▅▅▄▄▄▃▃▃▂▂▂▁▁▁▁▁▁▁▂▂▃▃▃▄▄▄▅▅▅▅▅▄▄  best -$0.0050
+  -$0.0087  DOT/USDT sell AH→buy HY   ▄▄▅▅▅▆▆▅▅▅▄▃▃▂▂▁▁▁▁▂▂▃▃▄▄▅▅▆▆▅▅▅▄▄▃▂▂▁▁▁▁  best -$0.0030  paused 3m
+  -$0.0090  ETH/DOT sell AH→buy HY    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  best -$0.0090
+  -$0.0130  DOT/USDC sell HY→buy AH   ▂▃▃▃▃▃▃▄▄▄▄▄▄▄▄▄▃▃▃▃▃▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▂▂▂  best -$0.0090
+  dotUSD on the AH pool, USDT each · ● sell (mint pays above $1) ● buy (redeem pays below $1)
+   $1.0101 ┤                ●●●●●●●●●                                     ●●●
+           ┤●●●●●●●●●●●●●●●●         ●●●●●●●●●●●●●●●●●                   ●   ●             ●●●●
+           ┤                                          ●●●●●●●●●●●●●●●●●●●     ●●●●●●●●●●●●●
+   $1.0024 ┤
+   $1.0000 ┤┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+           ┤        ●●●●●●●●●●●●●●●●●●●●●●●●●                             ●●●
+           ┤●●●●●●●●                         ●●●●●●●●●●●●●●              ●   ●        ●●●●●●●●●
+   $0.9920 ┤                                               ●●●●●●●●●●●●●●     ●●●●●●●●
+           └───────────────────────────────────────────────────────────────────────────────────
+            -15m                                                                            now
+  nearest trade gross, before network fees · cross-chain trades above +$0.014 (fees + min profit)
+   +$0.006 ┤             ████                                                       ████
+           ┤            ███████                                                    ███████
+    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄█████████┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄█████████┄┄┄┄
+           ┤███████████         ██████████████████████████████████████████████████         ████
+   -$0.006 ┤████                   ██████████████████████████                ██               █
+           └───────────────────────────────────────────────────────────────────────────────────
+            -15m                                                                            now
   DOT price   ● Asset Hub   ● Hydration   ◆ both
-   $0.9532 ┤        ●●◆◆◆◆◆◆●●●●●●●
-           ┤     ◆◆◆●●      ●●●    ●●●●●                                           ●●●●
-           ┤ ●●◆◆              ●●       ●●●●                                   ●●●●
-   $0.9519 ┤● ●                  ●●         ●●●●                           ●●●●      ●●
-           ┤●●                     ●●●          ●●●●                   ●●●●        ●●
-           ┤                          ●●●●        ●●◆◆◆◆◆◆◆◆◆●◆◆●●●●●●●          ●●
-           ┤                              ●●●●●●●●           ●  ●●●●●         ●●●
-   $0.9501 ┤                                                         ●●●●●●●●●
-           └───────────────────────────────────────────────────────────────────────────
-            -15m                                                                    now
-  nearest trade gross, before network fees · trades above +$0.014 (fees + min profit)
-    $0.000 ┤┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-           ┤███████████████████████████████████████████████████████████████████████████
-           ┤███         ███████████████████         ███████████████████          ██████
-           ┤                ████████████               ██                          ████
-   -$0.007 ┤                    ██████                                                █
-           └───────────────────────────────────────────────────────────────────────────
-            -15m                                                                    now
+   $0.9532 ┤         ●●●◆◆◆◆◆◆●●●●●●●●
+           ┤      ◆◆◆●●●      ●●●     ●●●●●                                                ●●●●
+           ┤  ●●◆◆               ●●●       ●●●●●                                       ●●●●
+   $0.9519 ┤●●●●                    ●●          ●●●●                              ●●●●●      ●●
+           ┤●●                        ●●●           ●●●●●                     ●●●●         ●●
+           ┤                             ●●●●          ●●◆◆◆◆◆◆◆◆◆◆●◆●●●●●●●●●          ●●●
+           ┤                                 ●●●●●●●●●●            ● ●●●●●●          ●●●
+   $0.9501 ┤                                                               ●●●●●●●●●●
+           └───────────────────────────────────────────────────────────────────────────────────
+            -15m                                                                            now
 ```
 
 How to read it (newest on the right):
 
+- **session / last 24h**: P&L split into trading (what the bot made) and
+  market (holding the coins). See [P&L](#pl).
+- **dotUSD** (on the status line and the first chart): what selling dotUSD on
+  the Asset Hub pool fetches (green, `o`) and what buying it costs (magenta,
+  `x`), against the dotted $1 line. Mint pays when the sell price climbs above
+  $1 by more than fees; redeem pays when the buy price drops below $1.
 - **routes**: every route the bot quotes, closest to profitable first. Each
   row shows the gross now, a sparkline of the window, and the best in the
   window. Bars are green above $0 and yellow once they clear the "needed"
   line, where a trade goes ahead. A route paused after a failure says
   `paused Nm`.
+- **nearest trade**: the best route's gross profit each tick, as bars around
+  the $0 line. The title gives what a cross-chain trade needs: the network
+  fees of a typical round trip (estimated every 10 minutes from real
+  transactions, nothing sent) plus `ARB_MIN_PROFIT_USD`.
+- **DOT price**: DOT on both chains on one shared scale, shown when the
+  window is tall enough.
 - **errors**: the two most frequent failures, with their stage and cost
   (shown only once something has failed).
-- **DOT price**: DOT on Asset Hub and on Hydration on one shared scale. The
-  vertical distance between the two lines is the arbitrage gap. ◆ marks where
-  both prices are equal.
-- **nearest trade**: the best tradeable route's gross profit each tick, as
-  bars around the $0 line. The title gives what a trade needs: the network
-  fees of a typical round trip (estimated every 10 minutes from real
-  transactions, nothing sent) plus `ARB_MIN_PROFIT_USD`. When that level is
-  inside the chart it is drawn as a dotted line.
 
 `npm run preview` draws this screen once from made-up data, without
 connecting to anything. Try `COLUMNS=60 LINES=24 npm run preview` or
@@ -272,17 +338,62 @@ it prints one line per tick, as before.
 
 ## Running on a server (e.g. a Raspberry Pi over SSH)
 
-Closing the SSH session sends `SIGHUP`. The bot finishes its current action
-and stops. To keep it running after you disconnect, start it inside tmux:
+The bot runs in a **tmux** session, so it keeps going when you disconnect and
+you can attach to the live dashboard whenever you SSH in. **systemd** starts
+that session at boot, and `scripts/run-forever.sh` restarts the bot after a
+crash. It does **not** restart after a halt (daily loss limit, an XCM that
+didn't arrive, `data/STOP`) or a stop you asked for: those want a look first.
+
+### One-time setup on the Pi
 
 ```sh
-tmux new -s arb          # start a session
-npm start                # run the bot
-# detach: Ctrl+B then D. Later, after you SSH back in:
-tmux attach -t arb
+sudo apt install tmux
+cd ~/ahrb && npm install       # .env with ARB_MNEMONIC (and your settings) next to package.json
+which node                     # note where node lives
 ```
 
-The bot warns at startup if it runs over SSH outside tmux or screen.
+Edit `scripts/arb.service`: `User`, the three `/home/pi/ahrb` paths, and
+`PATH`. If `which node` printed something under `~/.nvm/...`, put that `bin`
+directory first, e.g.
+`Environment=PATH=/home/pi/.nvm/versions/node/v20.18.0/bin:/usr/local/bin:/usr/bin:/bin`.
+Then:
+
+```sh
+sudo cp scripts/arb.service /etc/systemd/system/arb.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now arb      # starts now and at every boot
+```
+
+### Checking in
+
+```sh
+ssh pi@raspberrypi.local
+tmux attach -t arb        # the live dashboard. Leave with Ctrl+B then D, NOT Ctrl+C (that stops the bot)
+npm run pnl               # P&L by session, window and day (no need to attach)
+npm run errors            # what has failed
+tmux capture-pane -pt arb # print the current screen without attaching
+systemctl status arb      # is it running?
+cat data/restarts.log     # crashes the wrapper restarted
+```
+
+### Stopping, updating, restarting
+
+```sh
+sudo systemctl stop arb               # graceful: finishes the current step, then exits
+git pull && npm install               # update
+sudo systemctl start arb
+```
+
+After a halt, the session is gone and the service shows as inactive. Look at
+why (`npm run errors`, the last lines of `data/ledger.jsonl`), fix it,
+remove `data/STOP` if you used it, then `sudo systemctl start arb`. To record
+funds you added, stop it first, then `npm run deposit -- <usd>`, then start
+it.
+
+Without systemd, `tmux new -s arb` then `scripts/run-forever.sh` (or
+`npm start`) does the same until the Pi reboots. The bot warns at startup if
+it runs over SSH outside tmux or screen, because closing the SSH session
+would then stop it.
 
 ## ETH
 
@@ -302,6 +413,28 @@ money market.
   DOT could not be checked from Hydration.
 - Reserve kept back: 0.00003 ETH on Asset Hub, 0.000011 on Hydration (twice
   each chain's existential deposit).
+
+## dotUSD
+
+dotUSD is Asset Hub's PSM stablecoin: the PSM swaps USDT for dotUSD 1:1
+(mint fee 0 %, redeem fee 0.01 % on 2026-11-06), while the pool prices it
+against DOT. When the pool drifts off $1, the bot buys on one side and sells
+on the other in one atomic batch:
+
+- **mint** when the pool pays more than $1 for dotUSD: USDT → PSM → dotUSD →
+  pool → USDT.
+- **redeem** when the pool sells dotUSD for less than $1: USDT → pool →
+  dotUSD → PSM → USDT.
+
+The pool path is dotUSD ⇄ DOT ⇄ USDT (no direct dotUSD/USDT or dotUSD/USDC
+pool exists, and Hydration doesn't list dotUSD), two hops at 0.3 % each. So a
+loop needs the pool about 0.6 % off peg. On 2026-11-06 it quoted 0.9950 to
+sell and 1.0071 to buy. The first PSM trade on the Pi (a $5 mint) made
++$0.0117.
+
+To give it room, keep USDT on Asset Hub beyond the even split. A deposit
+there stays there: rebalancing only moves an asset when one side can't fund a
+minimum trade.
 
 ## Adding funds
 
@@ -360,7 +493,9 @@ does not create trades: the hard floor is still "net > fees".
 | `src/log.ts`, `src/chart.ts` | output, the live region mechanics, plots and sparklines |
 | `src/dashboard.ts`, `src/preview.ts` | what the live status shows; `npm run preview` draws it from fake data |
 | `src/errors.ts` | `npm run errors`: failures from the ledger |
+| `src/periods.ts`, `src/pnl-report.ts` | P&L by session and time window; `npm run pnl` |
 | `src/deposit.ts` | `npm run deposit -- <usd>`: record funds added or taken out |
+| `scripts/run-forever.sh`, `scripts/arb.service` | keep it running on a server: restart after crashes, start at boot in tmux |
 | `src/verify-xcm.ts` | `npm run verify-xcm -- <ASSET>`: read-only dry runs of every XCM path |
 
 `npm test` runs the specs (no network).

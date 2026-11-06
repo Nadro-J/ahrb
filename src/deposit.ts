@@ -21,7 +21,7 @@ if (!fs.existsSync(file)) {
   log.error(`no ${file}: the bot hasn't run yet, so the first run will count the whole balance anyway`);
   process.exit(1);
 }
-const state = JSON.parse(fs.readFileSync(file, 'utf8')) as State & { deposits?: { at: string; usd: number }[] };
+const state = JSON.parse(fs.readFileSync(file, 'utf8')) as State;
 const before = state.baseline.usd;
 state.baseline.usd += amount;
 (state.deposits ??= []).push({ at: new Date().toISOString(), usd: amount });

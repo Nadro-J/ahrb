@@ -6,6 +6,7 @@
  */
 import { barPlot, extent, linePlot, sparklineIn } from './chart.js';
 import { ascii, c, toAscii, usd, usdColored } from './log.js';
+import { duration, type Period } from './periods.js';
 
 /** The settings the dashboard reads; `main.ts` fills them from the config. */
 export const settings = {
@@ -42,16 +43,31 @@ export const ui = {
   paused: {} as Record<string, number>,
   /** The most frequent failures since the ledger began (from the ledger). */
   errors: [] as { what: string; stage: string; count: number; costUsd: number }[],
+  /** P&L of this run and of the last 24 hours (see periods.ts). */
+  session: null as { since: number; period: Period } | null,
+  last24: null as Period | null,
+  /** dotUSD on the Asset Hub pool, in USDT: what selling it fetches and what buying it costs (from the smallest PSM quote). */
+  peg: { sell: null as number | null, buy: null as number | null },
+  /** Which sides the current PSM quote round has priced already. */
+  pegSeen: { sell: false, buy: false },
 };
 
 /** Gross needed before a cross-chain trade goes ahead (fees + ARB_MIN_PROFIT_USD), once fees are known. */
 export const needed = () => (ui.fees === null ? null : ui.fees + settings.minProfitUsd);
 
 /** One sample per tick for the live charts, trimmed to the last `ARB_CHART_MINUTES`. */
-const history: { t: number; ah: number; hy: number | null; near: number | null; cands: Record<string, number> }[] = [];
+type Peg = { sell: number | null; buy: number | null };
+const history: { t: number; ah: number; hy: number | null; near: number | null; cands: Record<string, number>; peg: Peg }[] = [];
 
-export function recordSample(ah: number, hy: number | null, near: number | null, cands: Record<string, number>, now = Date.now()): void {
-  history.push({ t: now, ah, hy, near, cands });
+export function recordSample(
+  ah: number,
+  hy: number | null,
+  near: number | null,
+  cands: Record<string, number>,
+  now = Date.now(),
+  peg: Peg = { sell: null, buy: null }
+): void {
+  history.push({ t: now, ah, hy, near, cands, peg });
   while (history.length && history[0]!.t < now - settings.chartMinutes * 60_000) history.shift();
 }
 
@@ -103,9 +119,10 @@ function span(): string {
 
 /**
  * Charts of the last few minutes, sized to the terminal:
- *  - big (ARB_CHART_HEIGHT ≥ 3 and room on screen): DOT price on both chains
- *    as a line plot, and the nearest trade as bars around $0;
- *  - compact: one-line sparklines for price, spread and nearest trade;
+ *  - big (ARB_CHART_HEIGHT ≥ 3 and room on screen): dotUSD on the pool
+ *    against the $1 peg, the nearest trade as bars around $0, and DOT on
+ *    both chains when there is room for a third chart;
+ *  - compact: one-line sparklines for dotUSD, DOT spread and nearest trade;
  *  - none, when even that doesn't fit.
  * `statusRows` is what the status lines above already use; a few rows are left
  * free so the latest log lines stay visible.
@@ -116,67 +133,92 @@ function renderCharts(statusRows: number): string[] {
   const free = freeRows(statusRows);
   const need = needed();
   const threshold = need === null ? undefined : { value: need, paint: c.yellow };
-  const needText = need === null ? 'trades only above $0 + fees' : `trades above ${c.yellow(usd(need, 3))} ${c.dim('(fees + min profit)')}`;
+  const needText = need === null ? 'trades only above $0 + fees' : `cross-chain trades above ${c.yellow(usd(need, 3))} ${c.dim('(fees + min profit)')}`;
   const ah = history.map((h) => h.ah);
   const hy = history.map((h) => h.hy);
   const near = history.map((h) => h.near);
+  const sell = history.map((h) => h.peg.sell);
+  const buy = history.map((h) => h.peg.buy);
+  const hasPeg = sell.some((v) => v !== null) || buy.some((v) => v !== null);
   const nearPaint = (bar: string, v: number) => (v > 0 ? c.green(bar) : c.dim(bar));
+  const dim2 = (rows: string[]) => rows.map((r, i, all) => (i >= all.length - 2 ? c.dim(r) : r));
 
-  // Big: title + plot + 2 axis rows, twice.
   const labelWidth = 10;
   const width = Math.max(10, Math.min(history.length, cols - labelWidth - 2));
-  // Shrink the plots until both fit: each has a title row, its own rows and two axis rows.
+  // Shrink the plots until they fit: each has a title row, its own rows and two axis rows.
   const nearRows = (h: number) => Math.max(3, Math.round(h * 0.6));
-  let priceH = Math.floor(settings.chartHeight);
-  while (priceH >= 3 && 3 + priceH + 3 + nearRows(priceH) > free) priceH -= 1;
-  const nearH = nearRows(priceH);
-  if (priceH >= 3) {
+  let mainH = Math.floor(settings.chartHeight);
+  while (mainH >= 3 && 3 + mainH + 3 + nearRows(mainH) > free) mainH -= 1;
+  if (mainH >= 3) {
     const opts = { charset, labelWidth, leftLabel: span() } as const;
-    const ahMark = c.cyan(ascii ? 'o' : '●');
-    const hyMark = c.magenta(ascii ? 'x' : '●');
-    return [
-      `  ${c.bold('DOT price')}   ${ahMark} Asset Hub   ${hyMark} Hydration   ${c.dim(`${ascii ? '@' : '◆'} both`)}`,
-      ...linePlot(
-        [
-          { values: ah, mark: ascii ? 'o' : '●', paint: c.cyan },
-          { values: hy, mark: ascii ? 'x' : '●', paint: c.magenta },
-        ],
-        width,
-        priceH,
-        (v) => `$${v.toFixed(4)}`,
-        opts
-      ).map((r, i, all) => (i >= all.length - 2 ? c.dim(r) : r)),
-      `  ${c.bold('nearest trade')} ${c.dim('gross, before network fees ·')} ${c.dim(needText)}`,
-      ...barPlot(near, width, nearH, (v) => usd(v, 3), { ...opts, paint: nearPaint, threshold }).map((r, i, all) =>
-        i >= all.length - 2 ? c.dim(r) : r
-      ),
-    ];
+    const out: string[] = [];
+    const sellMark = c.green(ascii ? 'o' : '●');
+    const buyMark = c.magenta(ascii ? 'x' : '●');
+    if (hasPeg) {
+      out.push(`  ${c.bold('dotUSD')} ${c.dim('on the AH pool, USDT each ·')} ${sellMark} sell ${c.dim('(mint pays above $1)')} ${buyMark} buy ${c.dim('(redeem pays below $1)')}`);
+      out.push(
+        ...dim2(
+          linePlot(
+            [
+              { values: sell, mark: ascii ? 'o' : '●', paint: c.green },
+              { values: buy, mark: ascii ? 'x' : '●', paint: c.magenta },
+            ],
+            width,
+            mainH,
+            (v) => `$${v.toFixed(4)}`,
+            { ...opts, level: { value: 1, paint: c.yellow } }
+          )
+        )
+      );
+    }
+    out.push(`  ${c.bold('nearest trade')} ${c.dim('gross, before network fees ·')} ${c.dim(needText)}`);
+    out.push(...dim2(barPlot(near, width, nearRows(mainH), (v) => usd(v, 3), { ...opts, paint: nearPaint, threshold })));
+    // DOT on both chains, only if there is room left for it.
+    const left = free - out.length;
+    const dotH = Math.min(mainH, left - 3);
+    if (!hasPeg || dotH >= 3) {
+      const h = hasPeg ? dotH : mainH;
+      out.push(`  ${c.bold('DOT price')}   ${c.cyan(ascii ? 'o' : '●')} Asset Hub   ${c.magenta(ascii ? 'x' : '●')} Hydration   ${c.dim(`${ascii ? '@' : '◆'} both`)}`);
+      out.push(
+        ...dim2(
+          linePlot(
+            [
+              { values: ah, mark: ascii ? 'o' : '●', paint: c.cyan },
+              { values: hy, mark: ascii ? 'x' : '●', paint: c.magenta },
+            ],
+            width,
+            h,
+            (v) => `$${v.toFixed(4)}`,
+            opts
+          )
+        )
+      );
+    }
+    return out.slice(0, Math.max(0, free));
   }
 
-  // Compact: a heading and three sparklines.
+  // Compact: a heading and up to three sparklines.
   if (free < 4) return [];
-  const sw = Math.max(10, Math.min(120, cols - 11 - 26));
+  const sw = Math.max(10, Math.min(120, cols - 14 - 30));
   const spread = history.map((h) => (h.hy ? ((h.hy - h.ah) / h.ah) * 100 : null));
-  const px = extent([...ah, ...hy]);
+  const pg = extent([...sell, ...buy], 1);
   const sp = extent(spread, 0);
   const nr = extent(near, 0);
-  const row = (name: string, chart: string, legend: string) => `  ${c.dim(name.padEnd(10))}${chart}  ${c.dim(legend)}`;
+  const row = (name: string, chart: string, legend: string) => `  ${c.dim(name.padEnd(12))}${chart}  ${c.dim(legend)}`;
   const lines = [c.dim(`  ── last ${span().slice(1)} ${'─'.repeat(Math.max(0, sw - 8))}`)];
-  if (px) lines.push(row('DOT AH/HY', c.cyan(sparklineIn(charset, ah, sw, px)), `$${px[0].toFixed(4)}–$${px[1].toFixed(4)}`));
-  if (sp) lines.push(row('spread', sparklineIn(charset, spread, sw, sp), `${sp[0].toFixed(2)}% … ${sp[1] >= 0 ? '+' : ''}${sp[1].toFixed(2)}%`));
+  if (hasPeg && pg) {
+    const latest = history.at(-1)!.peg;
+    lines.push(
+      row('dotUSD sell', sparklineIn(charset, sell, sw, pg, (b, v) => (v > 1 ? c.green(b) : c.dim(b))), `now ${latest.sell?.toFixed(4) ?? '?'} · range $${pg[0].toFixed(4)}–$${pg[1].toFixed(4)} · mint pays > $1`)
+    );
+  }
+  if (sp) lines.push(row('DOT spread', sparklineIn(charset, spread, sw, sp), `${sp[0].toFixed(2)}% … ${sp[1] >= 0 ? '+' : ''}${sp[1].toFixed(2)}%`));
   if (nr) lines.push(row('nearest', sparklineIn(charset, near, sw, nr, nearPaint), `${usd(nr[0], 3)} … ${usd(nr[1], 3)} (green > 0)${need === null ? '' : `, needs ${usd(need, 3)}`}`));
-  return lines;
+  return lines.slice(0, free);
 }
 
 const SPIN = ascii ? '|/-\\' : '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 export const hhmm = () => new Date().toISOString().slice(11, 16);
-
-function ago(ms: number): string {
-  const m = Math.floor(ms / 60_000);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return h < 24 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${Math.floor(h / 24)}d${h % 24}h`;
-}
 
 export function renderLive(): string[] {
   const busy = ui.phase !== 'waiting';
@@ -189,19 +231,23 @@ export function renderLive(): string[] {
     dot = ` · DOT ${c.cyan('$' + ah.toFixed(4))} AH / ${c.cyan(hy ? '$' + hy.toFixed(4) : '?')} HY`;
     if (spread !== null) dot += c.dim(` (${spread >= 0 ? '+' : ''}${spread.toFixed(2)}%)`);
   }
-  const line1 = `${pulse} ${c.bold('LIVE')} #${ui.tick} ${c.dim('up ' + ago(Date.now() - ui.started))}${dot} · ${doing}`;
+  const line1 = `${pulse} ${c.bold('LIVE')} #${ui.tick} ${c.dim('up ' + duration(Date.now() - ui.started))}${dot} · ${doing}`;
 
   const near = ui.closest ? `${usdColored(ui.closest.gross)} ${c.dim(ui.closest.what)}` : c.dim('—');
   const rec = ui.record ? ` · best since start ${usdColored(ui.record.gross)} ${c.dim('at ' + ui.record.at)}` : '';
-  const line2 = `  nearest trade ${near}${rec}`;
+  const peg = ui.peg.sell !== null || ui.peg.buy !== null ? ` · dotUSD ${c.green(ui.peg.sell?.toFixed(4) ?? '?')}/${c.magenta(ui.peg.buy?.toFixed(4) ?? '?')}` : '';
+  const line2 = `  nearest trade ${near}${rec}${peg}`;
 
-  const line3 =
-    `  equity $${ui.equity.toFixed(2)} · P&L ${usdColored(ui.pnl, 2)} · today ${usdColored(ui.day, 2)}` +
-    c.dim(` (halt at −$${settings.maxDailyLossUsd})`) +
-    ` · arbs ${ui.arbs.done}${ui.arbs.failed ? c.red(` (${ui.arbs.failed} failed)`) : ''}` +
+  // P&L by time: this run, and the last 24 h. "trading" is what the bot's actions made; "market" is holding the coins.
+  const pnl = (x: Period) =>
+    `trading ${usdColored(x.trading)} ${c.dim(`(${x.arbs} arbs${x.failed ? `, ${x.failed} failed` : ''})`)} · market ${x.market === null ? c.dim('?') : usdColored(x.market, 2)}`;
+  const line3 = ui.session ? `  ${c.bold('session')} ${c.dim(duration(Date.now() - ui.session.since))}  ${pnl(ui.session.period)}` : '';
+  const line4 =
+    (ui.last24 ? `  ${c.bold('last 24h')}  ${pnl(ui.last24)} · ` : '  ') +
+    `equity $${ui.equity.toFixed(2)} · today ${usdColored(ui.day, 2)}${c.dim(` (halt at −$${settings.maxDailyLossUsd})`)}` +
     c.dim(` · last trade ${ui.lastTrade ?? 'none yet'}`);
 
-  const lines = [line1, line2, line3];
+  const lines = [line1, line2, ...(line3 ? [line3] : []), line4];
   if (ui.errors.length) {
     const list = ui.errors.map((e) => `${e.count}× ${e.what} ${c.dim(`(${e.stage}${e.costUsd ? ` ${usd(e.costUsd, 3)}` : ''})`)}`);
     lines.push(`  ${c.red('errors')} ${list.join(' · ')} ${c.dim('· npm run errors')}`);

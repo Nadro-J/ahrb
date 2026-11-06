@@ -1,0 +1,30 @@
+# systemd unit: starts the bot at boot in a detached tmux session named "arb",
+# so you can SSH in and `tmux attach -t arb` to see the live dashboard.
+#
+# Install (adjust User, the paths and PATH first; see README "Running on a server"):
+#   sudo cp scripts/arb.service /etc/systemd/system/arb.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now arb
+#
+# `systemctl stop arb` stops the bot gracefully: it presses Ctrl+C in the tmux
+# session, the bot finishes its current step and exits, and the unit waits for that.
+
+[Unit]
+Description=Asset Hub <-> Hydration arb bot (tmux session "arb")
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=pi
+WorkingDirectory=/home/pi/ahrb
+# node/npm must be on this PATH. If `which node` shows ~/.nvm/..., put that bin directory first.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/tmux new-session -d -s arb /home/pi/ahrb/scripts/run-forever.sh
+ExecStop=/bin/sh -c '/usr/bin/tmux send-keys -t arb C-c; while /usr/bin/tmux has-session -t arb 2>/dev/null; do sleep 1; done'
+TimeoutStopSec=300
+# The wrapper restarts crashes itself and deliberately stays down after a halt.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -55,6 +55,12 @@ export type Opportunity =
 export interface Limits {
   minTradeUsd: number;
   maxTradeUsd: number;
+  /**
+   * Largest PSM trade (default: maxTradeUsd). PSM loops are atomic, need only
+   * USDT on Asset Hub and go through the deep dotUSD/DOT pool, so they can
+   * size up further than cross-chain trades.
+   */
+  psmMaxTradeUsd?: number;
 }
 
 /**
@@ -73,9 +79,12 @@ export function tradeable(book: Book, chain: Chain, sym: Sym): bigint {
 
 /** Trade sizes to try, in USD: a ladder from the minimum up to the cap. */
 export function sizeLadder(l: Limits): number[] {
-  const steps = [1, 1.5, 2, 3, 4, 5, 7, 10, 15, 20];
+  const steps = [1, 1.5, 2, 3, 4, 5, 7, 10, 15, 20, 25, 30, 40, 50, 75, 100];
   const ladder = steps.map((s) => s * l.minTradeUsd).filter((s) => s <= l.maxTradeUsd + 1e-9);
-  return ladder.length ? ladder : [l.minTradeUsd];
+  if (!ladder.length) return [l.minTradeUsd];
+  // The cap itself is the last step, so e.g. a $25 cap is tried at $25 and not only at $20.
+  if (ladder.at(-1)! < l.maxTradeUsd - 1e-9) ladder.push(l.maxTradeUsd);
+  return ladder;
 }
 
 const units = (sym: Sym, usd: number, p: Prices) => native(usd / p[sym], ASSETS[sym].decimals);
@@ -92,89 +101,131 @@ async function quoteXchain(q: Quoter, sellOn: Chain, base: Sym, quote: Sym, size
   return { kind: 'xchain', sellOn, buyOn, base, quote, size, received, paid, grossUsd: toUsd(quote, received - paid, p) };
 }
 
+export type Observe = (o: Opportunity) => void;
+
 /**
- * Every candidate, screened at the smallest size; the ones in profit there
- * are walked up the size ladder and the most profitable size is kept.
- * Candidates the inventory can't fund are skipped. `observe` sees every
- * fundable quote, losing ones included (the status line shows the closest).
+ * Walk `sizes` up while the candidate stays fundable and keeps improving;
+ * return its most profitable size (null when no size pays). Every fundable
+ * quote goes to `observe`, losing ones included (the status shows the closest).
  */
-export async function findOpportunities(
-  q: Quoter,
-  book: Book,
-  p: Prices,
-  l: Limits,
-  psm: PsmState | null,
-  observe?: (o: Opportunity) => void
-): Promise<Opportunity[]> {
+async function bestSize(
+  sizes: number[],
+  quoteAt: (usd: number) => Promise<Opportunity | null>,
+  fits: (o: Opportunity) => boolean,
+  observe?: Observe
+): Promise<Opportunity | null> {
+  let top: Opportunity | null = null;
+  for (const usd of sizes) {
+    const o = await quoteAt(usd).catch(() => null);
+    if (!o || !fits(o)) break; // bigger only gets worse once inventory or the pools run out
+    observe?.(o);
+    if (o.grossUsd <= 0) break; // slippage grows with size: past break-even it never comes back
+    if (!top || o.grossUsd > top.grossUsd) top = o;
+  }
+  return top;
+}
+
+/** Run `jobs` with at most `n` in flight (quotes are RPC round trips; the public endpoints don't like 24 at once). */
+async function pool<T>(jobs: (() => Promise<T>)[], n: number): Promise<T[]> {
+  const out: T[] = new Array(jobs.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(n, jobs.length) }, async () => {
+      while (next < jobs.length) {
+        const i = next++;
+        out[i] = await jobs[i]!();
+      }
+    })
+  );
+  return out;
+}
+
+/**
+ * Every cross-chain candidate (each ordered pair of assets, both chain
+ * directions), screened at the smallest size; the ones in profit there are
+ * walked up the size ladder. Candidates the inventory can't fund are skipped.
+ */
+export async function findXchain(q: Quoter, book: Book, p: Prices, l: Limits, observe?: Observe, concurrency = 6): Promise<Opportunity[]> {
   const ladder = sizeLadder(l);
-  const found: Opportunity[] = [];
-
-  const best = async (sizes: number[], quoteAt: (usd: number) => Promise<Opportunity | null>, fits: (o: Opportunity) => boolean) => {
-    let top: Opportunity | null = null;
-    for (const usd of sizes) {
-      const o = await quoteAt(usd).catch(() => null);
-      if (!o || !fits(o)) break; // bigger only gets worse once inventory or the pools run out
-      observe?.(o);
-      if (o.grossUsd <= 0) break; // slippage grows with size: past break-even it never comes back
-      if (!top || o.grossUsd > top.grossUsd) top = o;
-    }
-    if (top) found.push(top);
-  };
-
+  const jobs: (() => Promise<Opportunity | null>)[] = [];
   for (const sellOn of CHAINS) {
     for (const base of SYMS) {
       for (const quote of SYMS) {
         if (base === quote) continue;
         const buyOn = other(sellOn);
-        await best(
-          ladder,
-          (usd) => quoteXchain(q, sellOn, base, quote, units(base, usd, p), p),
-          (o) =>
-            o.kind === 'xchain' &&
-            o.size <= tradeable(book, sellOn, base) &&
-            o.paid <= tradeable(book, buyOn, quote) &&
-            o.size > 0n
+        jobs.push(() =>
+          bestSize(
+            ladder,
+            (usd) => quoteXchain(q, sellOn, base, quote, units(base, usd, p), p),
+            (o) => o.kind === 'xchain' && o.size <= tradeable(book, sellOn, base) && o.paid <= tradeable(book, buyOn, quote) && o.size > 0n,
+            observe
+          )
         );
       }
     }
   }
-
-  if (psm) {
-    const usdt = tradeable(book, 'AH', 'USDT');
-    if (psm.canMint) {
-      await best(
-        ladder,
-        async (usd) => {
-          const usdtIn = units('USDT', usd, p);
-          if (usdtIn < psm.minSwap || usdtIn > psm.mintHeadroom) return null;
-          const minted = usdtIn - psmFee(usdtIn, psm.mintFee);
-          const usdtOut = await q.ahIn(ahPath('dotUSD', 'USDT'), minted);
-          if (!usdtOut) return null;
-          return { kind: 'psm-mint', usdtIn, minted, usdtOut, grossUsd: toUsd('USDT', usdtOut - usdtIn, p) };
-        },
-        (o) => o.kind === 'psm-mint' && o.usdtIn <= usdt
-      );
-    }
-    if (psm.canRedeem) {
-      await best(
-        ladder,
-        async (usd) => {
-          const dotUsd = units('USDT', usd, p); // same 6 decimals, $1 peg
-          if (dotUsd < psm.minSwap) return null;
-          const usdtIn = await q.ahOut(ahPath('USDT', 'dotUSD'), dotUsd);
-          if (!usdtIn) return null;
-          const usdtOut = dotUsd - psmFee(dotUsd, psm.redeemFee);
-          return { kind: 'psm-redeem', dotUsd, usdtIn, usdtOut, grossUsd: toUsd('USDT', usdtOut - usdtIn, p) };
-        },
-        (o) => o.kind === 'psm-redeem' && o.usdtIn <= usdt
-      );
-    }
-  }
-
+  const found = (await pool(jobs, concurrency)).filter((o): o is Opportunity => o !== null);
   return found.sort((a, b) => b.grossUsd - a.grossUsd);
 }
 
-/** A few words naming the candidate, for the status line. */
+/**
+ * The two PSM loops on Asset Hub, sized up to `psmMaxTradeUsd`, funded from
+ * Asset Hub USDT:
+ *   psm-mint    USDT → PSM mint → dotUSD → pool (dotUSD→DOT→USDT): pays when dotUSD > $1
+ *   psm-redeem  USDT → pool (USDT→DOT→dotUSD) → PSM redeem → USDT: pays when dotUSD < $1
+ */
+export async function findPsm(q: Quoter, book: Book, p: Prices, l: Limits, psm: PsmState, observe?: Observe): Promise<Opportunity[]> {
+  const ladder = sizeLadder({ minTradeUsd: l.minTradeUsd, maxTradeUsd: l.psmMaxTradeUsd ?? l.maxTradeUsd });
+  const usdt = tradeable(book, 'AH', 'USDT');
+  const [mint, redeem] = await Promise.all([
+    psm.canMint
+      ? bestSize(
+          ladder,
+          async (usd) => {
+            const usdtIn = units('USDT', usd, p);
+            if (usdtIn < psm.minSwap || usdtIn > psm.mintHeadroom) return null;
+            const minted = usdtIn - psmFee(usdtIn, psm.mintFee);
+            const usdtOut = await q.ahIn(ahPath('dotUSD', 'USDT'), minted);
+            if (!usdtOut) return null;
+            return { kind: 'psm-mint', usdtIn, minted, usdtOut, grossUsd: toUsd('USDT', usdtOut - usdtIn, p) };
+          },
+          (o) => o.kind === 'psm-mint' && o.usdtIn <= usdt,
+          observe
+        )
+      : null,
+    psm.canRedeem
+      ? bestSize(
+          ladder,
+          async (usd) => {
+            const dotUsd = units('USDT', usd, p); // same 6 decimals, $1 peg
+            if (dotUsd < psm.minSwap) return null;
+            const usdtIn = await q.ahOut(ahPath('USDT', 'dotUSD'), dotUsd);
+            if (!usdtIn) return null;
+            const usdtOut = dotUsd - psmFee(dotUsd, psm.redeemFee);
+            return { kind: 'psm-redeem', dotUsd, usdtIn, usdtOut, grossUsd: toUsd('USDT', usdtOut - usdtIn, p) };
+          },
+          (o) => o.kind === 'psm-redeem' && o.usdtIn <= usdt,
+          observe
+        )
+      : null,
+  ]);
+  return [mint, redeem].filter((o): o is Opportunity => o !== null).sort((a, b) => b.grossUsd - a.grossUsd);
+}
+
+/** dotUSD's price on the Asset Hub pool in USDT, from a PSM quote: what selling it fetches (mint) or buying it costs (redeem). */
+export function pegPrice(o: Opportunity): { side: 'sell' | 'buy'; price: number } | null {
+  if (o.kind === 'psm-mint') return { side: 'sell', price: Number(o.usdtOut) / Number(o.minted) };
+  if (o.kind === 'psm-redeem') return { side: 'buy', price: Number(o.usdtIn) / Number(o.dotUsd) };
+  return null;
+}
+
+/** Cross-chain and PSM candidates together, best first. */
+export async function findOpportunities(q: Quoter, book: Book, p: Prices, l: Limits, psm: PsmState | null, observe?: Observe): Promise<Opportunity[]> {
+  const [x, m] = await Promise.all([findXchain(q, book, p, l, observe), psm ? findPsm(q, book, p, l, psm, observe) : Promise.resolve([])]);
+  return [...x, ...m].sort((a, b) => b.grossUsd - a.grossUsd);
+}
+
+/** A few words naming the candidate's route, for the status and cooldowns. */
 export function label(o: Opportunity): string {
   if (o.kind === 'xchain') return `${o.base}/${o.quote} sell ${o.sellOn}→buy ${o.buyOn}`;
   return o.kind;

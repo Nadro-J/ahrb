@@ -127,3 +127,32 @@ describe('error notes', () => {
     expect(Ledger.open(dir, 'acct', 40, P).ledger.state.errors).toEqual({});
   });
 });
+
+describe('sessions', () => {
+  it('tracks the running session and snapshots equity every 10 minutes', () => {
+    const dir = tmp();
+    const { ledger } = Ledger.open(dir, 'acct', 40, P);
+    const t0 = new Date('2026-11-06T00:00:00Z');
+    const later = (min: number) => new Date(t0.getTime() + min * 60_000);
+    ledger.startSession(40, t0);
+    ledger.record({ ...entry('arb', 0.02), ts: later(5).toISOString() });
+    ledger.touch(39.5, later(6));
+    expect(ledger.snapshots).toHaveLength(1); // under 10 min: kept in memory only
+    ledger.touch(39.6, later(12));
+    expect(ledger.snapshots).toHaveLength(2);
+
+    const s = ledger.sessionPnl(39.6, later(12).getTime())!;
+    expect(s.period.arb).toBeCloseTo(0.02);
+    expect(s.period.total).toBeCloseTo(-0.4);
+    expect(s.period.market).toBeCloseTo(-0.42);
+
+    // A restart reads it all back and starts a second session.
+    const again = Ledger.open(dir, 'acct', 39.6, P).ledger;
+    expect(again.entries).toHaveLength(1);
+    expect(again.snapshots).toHaveLength(2);
+    again.startSession(39.6, later(20));
+    expect(again.state.sessions.map((x) => x.equityStart)).toEqual([40, 39.6]);
+    expect(again.sessionPnl(39.6, later(21).getTime())!.period.arb).toBe(0);
+    expect(again.windowPnl(1, 39.6, later(21).getTime()).arb).toBeCloseTo(0.02);
+  });
+});

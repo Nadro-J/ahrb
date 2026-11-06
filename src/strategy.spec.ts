@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Sym } from './assets.js';
 import type { Book, Prices } from './chains.js';
-import { Cooldowns, findOpportunities, planRebalance, RESERVE, sizeLadder, tradeable, type Quoter } from './strategy.js';
+import { Cooldowns, findOpportunities, findPsm, pegPrice, planRebalance, RESERVE, sizeLadder, tradeable, type Quoter } from './strategy.js';
 import { psmFee, type AhSym, type PsmState } from './venues.js';
 
 const P: Prices = { DOT: 1, USDT: 1, USDC: 1, ETH: 1, dotUSD: 1, HDX: 0.01 };
@@ -56,6 +56,10 @@ describe('sizeLadder', () => {
   it('walks from the minimum to the cap', () => {
     expect(sizeLadder({ minTradeUsd: 1, maxTradeUsd: 5 })).toEqual([1, 1.5, 2, 3, 4, 5]);
     expect(sizeLadder({ minTradeUsd: 2, maxTradeUsd: 1 })).toEqual([2]);
+  });
+
+  it('ends on the cap itself when the cap falls between steps', () => {
+    expect(sizeLadder({ minTradeUsd: 1, maxTradeUsd: 22 }).slice(-3)).toEqual([15, 20, 22]);
   });
 });
 
@@ -144,6 +148,23 @@ describe('findOpportunities: PSM', () => {
   it('mints when dotUSD trades above the peg by more than the pool fees', async () => {
     const opps = await findOpportunities(market({ dotUSD: 1.02 }, {}), EVEN, P, LIMITS, psm());
     expect(opps[0]?.kind).toBe('psm-mint');
+  });
+
+  it('sizes PSM trades up to their own cap, within the Asset Hub USDT', async () => {
+    const rich = book([7, 60, 7], [7, 7, 7]);
+    const big = await findPsm(market({ dotUSD: 1.05 }, {}, 0.003, 0.0001), rich, P, { ...LIMITS, psmMaxTradeUsd: 25 }, psm());
+    expect(big[0]!.kind === 'psm-mint' && Number(big[0]!.usdtIn) / 1e6).toBe(25);
+    const poor = await findPsm(market({ dotUSD: 1.05 }, {}, 0.003, 0.0001), EVEN, P, { ...LIMITS, psmMaxTradeUsd: 25 }, psm());
+    expect(poor[0]!.kind === 'psm-mint' && Number(poor[0]!.usdtIn) / 1e6).toBeLessThanOrEqual(7);
+  });
+
+  it('pegPrice reads dotUSD\'s pool price off a PSM quote', async () => {
+    const seen: number[] = [];
+    await findPsm(market({ dotUSD: 1.02 }, {}, 0, 0), EVEN, P, LIMITS, psm(), (o) => {
+      const peg = pegPrice(o);
+      if (peg?.side === 'sell') seen.push(peg.price);
+    });
+    expect(seen[0]).toBeCloseTo(1.02, 3);
   });
 
   it('redeems when dotUSD trades below the peg', async () => {

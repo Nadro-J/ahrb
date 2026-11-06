@@ -15,11 +15,14 @@
  *             = arb profit + setup costs + rebalance costs + market
  *
  * State lives in `<dataDir>/state.json`, one line per action in
- * `<dataDir>/ledger.jsonl`.
+ * `<dataDir>/ledger.jsonl`, and an equity snapshot every 10 minutes in
+ * `<dataDir>/equity.jsonl` (for P&L over rolling windows; see periods.ts).
+ * Each run of the bot is a session in `state.sessions`.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Book, Prices } from './chains.js';
+import { sessionPeriod, windowPeriod, type Deposit, type EntryLite, type Period, type Session, type Snapshot } from './periods.js';
 
 export type ActionKind = 'setup' | 'arb' | 'rebalance';
 
@@ -81,20 +84,50 @@ export interface State {
   day: { date: string; pnlUsd: number };
   /** Failures grouped by `${kind} ${stage} ${errorKey}`. */
   errors: Record<string, ErrorStat>;
+  /** One per run, newest last. */
+  sessions: Session[];
+  /** Funds added (or taken out, negative), recorded by `npm run deposit`. */
+  deposits: Deposit[];
 }
 
+/** How often equity is snapshotted (and state.json rewritten while idle: the Pi's SD card would rather not every tick). */
+const SNAPSHOT_MS = 10 * 60_000;
+const MAX_SESSIONS = 500;
+
 const today = () => new Date().toISOString().slice(0, 10);
+
+/** One JSON object per line; missing file = none. A torn last line (power cut mid-write) is skipped. */
+function readLines<T>(file: string): T[] {
+  if (!fs.existsSync(file)) return [];
+  const out: T[] = [];
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as T);
+    } catch {
+      // ignore
+    }
+  }
+  return out;
+}
 const bigintJson = (_k: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
 
 export class Ledger {
   readonly statePath: string;
   readonly ledgerPath: string;
+  readonly equityPath: string;
   state: State;
+  /** Every ledger entry, slimmed to what the period math needs. */
+  readonly entries: EntryLite[];
+  readonly snapshots: Snapshot[];
 
   private constructor(dir: string, state: State) {
     this.statePath = path.join(dir, 'state.json');
     this.ledgerPath = path.join(dir, 'ledger.jsonl');
+    this.equityPath = path.join(dir, 'equity.jsonl');
     this.state = state;
+    this.entries = readLines<EntryLite>(this.ledgerPath).map(({ ts, kind, realizedUsd, ok }) => ({ ts, kind, realizedUsd, ok }));
+    this.snapshots = readLines<Snapshot>(this.equityPath);
   }
 
   /** Loads the account's state, or starts one with today's equity as the baseline. */
@@ -103,7 +136,10 @@ export class Ledger {
     const file = path.join(dir, 'state.json');
     if (fs.existsSync(file)) {
       const state = JSON.parse(fs.readFileSync(file, 'utf8')) as State;
-      state.errors ??= {}; // added after the first state files were written
+      // Added after the first state files were written.
+      state.errors ??= {};
+      state.sessions ??= [];
+      state.deposits ??= [];
       if (state.account !== account) {
         throw new Error(`${file} belongs to ${state.account}, not ${account}. Use another ARB_DATA_DIR or move the file away.`);
       }
@@ -120,6 +156,8 @@ export class Ledger {
       arbs: { done: 0, profitable: 0, failed: 0 },
       day: { date: today(), pnlUsd: 0 },
       errors: {},
+      sessions: [],
+      deposits: [],
     };
     const ledger = new Ledger(dir, state);
     ledger.save();
@@ -134,7 +172,10 @@ export class Ledger {
 
   record(e: LedgerEntry): void {
     fs.appendFileSync(this.ledgerPath, JSON.stringify(e, bigintJson) + '\n');
+    this.entries.push({ ts: e.ts, kind: e.kind, realizedUsd: e.realizedUsd, ok: e.ok });
     const s = this.state;
+    const cur = s.sessions.at(-1);
+    if (cur) cur.end = e.ts;
     this.rollDay();
     s.totals[e.kind] += e.realizedUsd;
     if (e.kind !== 'setup') s.day.pnlUsd += e.realizedUsd;
@@ -161,6 +202,54 @@ export class Ledger {
       lastWhat: e.what,
       lastMessage: e.error!,
     };
+  }
+
+  /* ------------------------------------------------------------ sessions */
+
+  /** Start a session at `equityUsd` (the bot just started). The previous one keeps the last end it recorded. */
+  startSession(equityUsd: number, now = new Date()): void {
+    const at = now.toISOString();
+    this.state.sessions.push({ start: at, end: at, equityStart: equityUsd, equityEnd: equityUsd });
+    if (this.state.sessions.length > MAX_SESSIONS) this.state.sessions.splice(0, this.state.sessions.length - MAX_SESSIONS);
+    this.snapshot(equityUsd, now);
+    this.save();
+  }
+
+  /**
+   * The bot is still running with this equity. Updates the session in memory,
+   * and every 10 minutes writes an equity snapshot and state.json. `force`
+   * writes now (at stop).
+   */
+  touch(equityUsd: number, now = new Date(), force = false): void {
+    const cur = this.state.sessions.at(-1);
+    if (cur) {
+      cur.end = now.toISOString();
+      cur.equityEnd = equityUsd;
+    }
+    const last = this.snapshots.at(-1);
+    if (force || !last || now.getTime() - Date.parse(last.ts) >= SNAPSHOT_MS) {
+      this.snapshot(equityUsd, now);
+      this.save();
+    }
+  }
+
+  private snapshot(usd: number, now: Date): void {
+    const s = { ts: now.toISOString(), usd };
+    this.snapshots.push(s);
+    fs.appendFileSync(this.equityPath, JSON.stringify(s) + '\n');
+  }
+
+  /** P&L of the running session, with equity as of now. */
+  sessionPnl(equityUsd: number, now = Date.now()): { period: Period; startedAt: string } | null {
+    const cur = this.state.sessions.at(-1);
+    if (!cur) return null;
+    const s = { ...cur, end: new Date(now).toISOString(), equityEnd: equityUsd };
+    return { period: sessionPeriod(this.entries, s), startedAt: cur.start };
+  }
+
+  /** P&L over the last `hours`. */
+  windowPnl(hours: number, equityUsd: number, now = Date.now()): Period {
+    return windowPeriod(this.entries, this.snapshots, this.state.deposits, hours, now, equityUsd);
   }
 
   /** The most frequent failures first. */
