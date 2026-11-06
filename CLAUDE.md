@@ -22,7 +22,7 @@ npm run verify-xcm -- ETH          # read-only dry runs of every XCM path the bo
 
 - Always start through `npm start`. `--no-opt` works around a V8 optimizing-compiler crash under polkadot-api on Node 20/22. Running `src/main.ts` with plain `tsx` or `node` crashes. The same V8 bug can crash `tsc`, so `npm run typecheck` runs it with `--no-opt` too; run network scripts as `node --no-opt --import tsx <file>`.
 - Exit code 2 means a deliberate halt (`Halt`). npm prints its own error lines after that, which is expected.
-- On the Pi it runs via `scripts/arb.service` (systemd, starts a detached tmux session `arb` at boot) → `scripts/run-forever.sh`, which restarts on a crash but deliberately not on exit 0 (asked to stop), 2 (halt) or 130 (forced). Keep those exit-code meanings stable.
+- On the Pi it runs via `scripts/arb.service` (systemd, starts a detached tmux session `arb` at boot) → `scripts/run-forever.sh`, which logs every start/exit to `data/runs.log` and restarts on a crash but deliberately not on exit 0 (asked to stop), 2 (halt) or 130 (forced). Keep those exit-code meanings stable.
 - Stop the bot with `touch data/STOP` (it halts at the next tick and refuses to start while the file exists), `ARB_KILL=1`, or Ctrl+C (finishes the current action; press twice to force). It halts by itself only on the daily loss limit or an XCM not arriving within 10 min. **Failed trades must not stop it** (the user's call): they are counted in the ledger (`State.errors`, keyed `kind stage Pallet.Error`) and the route is paused by `Cooldowns` (1 min, doubling to 30 min, cleared by a success).
 
 ## Architecture

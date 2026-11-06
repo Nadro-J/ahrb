@@ -373,8 +373,23 @@ npm run pnl               # P&L by session, window and day (no need to attach)
 npm run errors            # what has failed
 tmux capture-pane -pt arb # print the current screen without attaching
 systemctl status arb      # is it running?
-cat data/restarts.log     # crashes the wrapper restarted
+cat data/runs.log         # every start, crash, halt and stop, with its exit code
 ```
+
+### If `tmux attach` says "no sessions"
+
+The bot stopped, or never started, and the session closed with it. Check:
+
+```sh
+tail data/runs.log                 # why it stopped: exit 2 = halted, 0 = stopped
+journalctl -u arb -n 30            # what systemd saw
+./scripts/run-forever.sh           # run it in the foreground to see any error (Ctrl+C to stop)
+```
+
+A service that lasts only milliseconds means the script itself didn't run:
+a wrong path in `arb.service`, or Windows line endings (`file
+scripts/run-forever.sh` says "CRLF"; fix with `sed -i 's/\r$//'
+scripts/run-forever.sh`).
 
 ### Stopping, updating, restarting
 

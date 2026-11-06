@@ -20,8 +20,9 @@ User=pi
 WorkingDirectory=/home/pi/ahrb
 # node/npm must be on this PATH. If `which node` shows ~/.nvm/..., put that bin directory first.
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/tmux new-session -d -s arb /home/pi/ahrb/scripts/run-forever.sh
-ExecStop=/bin/sh -c '/usr/bin/tmux send-keys -t arb C-c; while /usr/bin/tmux has-session -t arb 2>/dev/null; do sleep 1; done'
+# Run through bash, so the script needs no execute bit.
+ExecStart=/usr/bin/tmux new-session -d -s arb /bin/bash /home/pi/ahrb/scripts/run-forever.sh
+ExecStop=/bin/sh -c '/usr/bin/tmux send-keys -t arb C-c 2>/dev/null; while /usr/bin/tmux has-session -t arb 2>/dev/null; do sleep 1; done'
 TimeoutStopSec=300
 # The wrapper restarts crashes itself and deliberately stays down after a halt.
 Restart=no
